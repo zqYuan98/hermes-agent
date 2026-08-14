@@ -73,7 +73,7 @@ else:
             delattr(self._resolve(), name)
 
     httpx = _LazyHttpx()
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -82,12 +82,22 @@ from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tup
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from hermes_cli.config import (
+    _CONFIG_LOCK,
+    _read_raw_config_locked,
     get_hermes_home,
     get_config_path,
     read_raw_config,
     require_readable_config_before_write,
 )
-from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
+from hermes_constants import (
+    OPENROUTER_BASE_URL,
+    get_hermes_home_override,
+    profile_mutation_lock,
+    profile_mutation_locks,
+    reset_hermes_home_override,
+    secure_parent_dir,
+    set_hermes_home_override,
+)
 from agent.credential_persistence import sanitize_borrowed_credential_payload
 from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
 
@@ -1088,6 +1098,23 @@ def _global_auth_file_path() -> Optional[Path]:
     return global_root / "auth.json"
 
 
+def _global_auth_file_path_for_write() -> Optional[Path]:
+    """Return a safe global-root auth target for an explicit write transaction."""
+    global_path = _global_auth_file_path()
+    if global_path is None:
+        return None
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        real_home_env = os.environ.get("HOME", "")
+        if real_home_env:
+            real_root = Path(real_home_env) / ".hermes" / "auth.json"
+            try:
+                if global_path.resolve(strict=False) == real_root.resolve(strict=False):
+                    return None
+            except Exception:
+                return None
+    return global_path
+
+
 def _load_global_auth_store() -> Dict[str, Any]:
     """Load the global-root auth store (read-only fallback).
 
@@ -1128,23 +1155,26 @@ def _auth_lock_path() -> Path:
     return _auth_file_path().with_suffix(".lock")
 
 
+_auth_lock_holder = threading.local()
 _auth_target_lock_holders: Dict[str, threading.local] = {}
 _auth_target_lock_holders_guard = threading.Lock()
+_auth_store_context_holder = threading.local()
 
 
 def _same_path(left: Path, right: Path) -> bool:
+    """Compare auth-store paths without requiring either path to exist."""
     try:
-        return left.resolve(strict=False) == right.resolve(strict=False)
+        return Path(left).resolve(strict=False) == Path(right).resolve(strict=False)
     except Exception:
-        return left == right
+        return Path(left) == Path(right)
 
 
 def _auth_lock_holder_for(target_path: Path) -> threading.local:
-    """Return a reentrancy tracker keyed to one canonical auth-store path."""
+    """Return a thread-local reentrancy tracker for one canonical auth store."""
     try:
-        key = str(target_path.resolve(strict=False))
+        key = str(Path(target_path).resolve(strict=False))
     except Exception:
-        key = str(target_path)
+        key = str(Path(target_path))
     with _auth_target_lock_holders_guard:
         return _auth_target_lock_holders.setdefault(key, threading.local())
 
@@ -1158,29 +1188,39 @@ def _file_lock(
 ):
     """Cross-process advisory flock helper.
 
-    Reentrant per-thread via ``holder.depth``. Falls back to a depth-only
-    guard when neither ``fcntl`` nor ``msvcrt`` is available (rare).
-    Callers supply their own ``threading.local`` so independent locks
-    (e.g. profile auth.json vs shared Nous store) don't share reentrancy
-    state — that would let one lock's reentrant acquisition silently skip
-    the other's kernel-level flock.
+    Reentrant per-thread and canonical lock path via ``holder.depths``.
+    Falls back to a path-scoped depth guard when neither ``fcntl`` nor
+    ``msvcrt`` is available (rare).  One holder may therefore coordinate a
+    deterministic set of auth-store locks without silently skipping the
+    kernel lock for a different path.
     """
-    if getattr(holder, "depth", 0) > 0:
-        holder.depth += 1
+    lock_path = Path(lock_path)
+    lock_key = os.path.normcase(os.path.abspath(os.fspath(lock_path)))
+    depths = getattr(holder, "depths", None)
+    if depths is None:
+        depths = {}
+        holder.depths = depths
+    depth = depths.get(lock_key, 0)
+    if depth:
+        depths[lock_key] = depth + 1
+        holder.depth = getattr(holder, "depth", 0) + 1
         try:
             yield
         finally:
+            depths[lock_key] -= 1
             holder.depth -= 1
         return
 
     lock_path.parent.mkdir(parents=True, exist_ok=True)
 
     if fcntl is None and msvcrt is None:
-        holder.depth = 1
+        depths[lock_key] = 1
+        holder.depth = getattr(holder, "depth", 0) + 1
         try:
             yield
         finally:
-            holder.depth = 0
+            depths.pop(lock_key, None)
+            holder.depth -= 1
         return
 
     # On Windows, msvcrt.locking needs the file to have content and the
@@ -1203,11 +1243,13 @@ def _file_lock(
                     raise TimeoutError(timeout_message)
                 time.sleep(0.05)
 
-        holder.depth = 1
+        depths[lock_key] = 1
+        holder.depth = getattr(holder, "depth", 0) + 1
         try:
             yield
         finally:
-            holder.depth = 0
+            depths.pop(lock_key, None)
+            holder.depth -= 1
             if fcntl:
                 try:
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
@@ -1221,37 +1263,231 @@ def _file_lock(
                     pass
 
 
+@dataclass(frozen=True)
+class _AuthStoreLockContext:
+    active_path: Path
+    global_path: Optional[Path]
+    scope_override: Optional[str]
+
+
+@dataclass(frozen=True)
+class _AuthStoreIncarnation:
+    profile_home: Path
+    directory_identity: Tuple[int, int]
+    generation: Optional[bytes]
+
+
 @contextmanager
 def _auth_store_lock(
     timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS,
     *,
+    include_global_root: bool = False,
     target_path: Optional[Path] = None,
 ):
-    """Cross-process advisory lock for one auth.json read/write transaction.
+    """Lock one immutable active/global auth identity for the whole thread stack.
 
-    ``target_path`` is required for profile-to-global write-throughs. A profile
-    lock does not protect the distinct global auth store; each path therefore
-    uses its own reentrancy tracker and kernel lock.
-
-    Lock ordering invariant: when this lock is held together with
-    ``_nous_shared_store_lock``, acquire ``_auth_store_lock`` FIRST
-    (outer) and the shared Nous lock SECOND (inner). All runtime
-    refresh paths follow this order; violating it risks deadlock
-    against a concurrent import on the shared store.
+    Ordering is ``sorted Profile locks -> sorted auth-file locks -> shared
+    Nous store``. Nested auth helpers reuse the outer context without
+    re-resolving Profile identity. Expanding an active-only transaction to add
+    the global root after acquisition is rejected because it would violate the
+    deterministic multi-lock order.
     """
-    auth_path = target_path if target_path is not None else _auth_file_path()
-    lock_path = auth_path.with_suffix(".lock") if target_path is not None else _auth_lock_path()
-    with _file_lock(
-        lock_path,
-        _auth_lock_holder_for(auth_path),
-        timeout_seconds,
-        "Timed out waiting for auth store lock",
-    ):
-        yield
+    existing = getattr(_auth_store_context_holder, "context", None)
+    current_override = get_hermes_home_override()
+    if current_override is not None:
+        current_override = str(Path(current_override).resolve(strict=False))
+    if existing is not None and current_override == existing.scope_override:
+        if target_path is not None:
+            requested = Path(target_path).resolve(strict=False)
+            active = existing.active_path.resolve(strict=False)
+            if requested != active:
+                raise RuntimeError(
+                    "Cannot change the active auth store inside a nested auth transaction"
+                )
+        if include_global_root and existing.global_path is None:
+            raise RuntimeError(
+                "Cannot expand the active auth store lock set to the global root"
+            )
+        _auth_store_context_holder.depth += 1
+        try:
+            yield existing
+        finally:
+            _auth_store_context_holder.depth -= 1
+        return
+
+    if target_path is not None and include_global_root:
+        raise ValueError(
+            "Explicit auth target cannot be combined with ambient global-root resolution"
+        )
+    active_path = Path(target_path) if target_path is not None else Path(_auth_file_path())
+    global_path = (
+        _global_auth_file_path_for_write() if include_global_root else None
+    )
+    auth_paths = tuple(
+        sorted(
+            {
+                Path(path).resolve(strict=False)
+                for path in (active_path, global_path)
+                if path is not None
+            },
+            key=os.fspath,
+        )
+    )
+    profile_homes = tuple(path.parent for path in auth_paths)
+    deadline = time.monotonic() + max(1.0, timeout_seconds)
+    context = _AuthStoreLockContext(
+        active_path=active_path,
+        global_path=Path(global_path) if global_path is not None else None,
+        scope_override=current_override,
+    )
+    previous_context = existing
+    previous_depth = getattr(_auth_store_context_holder, "depth", 0)
+
+    with ExitStack() as stack:
+        if include_global_root:
+            stack.enter_context(
+                profile_mutation_locks(profile_homes, timeout=timeout_seconds)
+            )
+        else:
+            stack.enter_context(
+                profile_mutation_lock(profile_homes[0], timeout=timeout_seconds)
+            )
+        for auth_path in auth_paths:
+            remaining = max(1.0, deadline - time.monotonic())
+            stack.enter_context(
+                _file_lock(
+                    auth_path.with_suffix(".lock"),
+                    _auth_lock_holder_for(auth_path),
+                    remaining,
+                    "Timed out waiting for auth store lock",
+                )
+            )
+        _auth_store_context_holder.context = context
+        _auth_store_context_holder.depth = 1
+        try:
+            yield context
+        finally:
+            if previous_context is None:
+                _auth_store_context_holder.depth = 0
+                del _auth_store_context_holder.context
+            else:
+                _auth_store_context_holder.context = previous_context
+                _auth_store_context_holder.depth = previous_depth
+
+
+def _current_auth_store_context() -> Optional[_AuthStoreLockContext]:
+    """Return the immutable identity owned by the current auth transaction."""
+    return getattr(_auth_store_context_holder, "context", None)
+
+
+_AUTH_ACTIVE_PROVIDER_MISSING = object()
+_PROFILE_GENERATION_FILENAME = ".webui-profile-generation"
+_MAX_PROFILE_GENERATION_BYTES = 128
+
+
+def _read_auth_profile_generation_token(profile_home: Path) -> Optional[bytes]:
+    """Read an existing private Profile generation without creating one."""
+    path = Path(profile_home) / _PROFILE_GENERATION_FILENAME
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise RuntimeError("Profile generation must be a regular file")
+        if info.st_size <= 0 or info.st_size > _MAX_PROFILE_GENERATION_BYTES:
+            raise RuntimeError("Profile generation has an invalid size")
+        payload = os.read(fd, _MAX_PROFILE_GENERATION_BYTES + 1)
+        if not payload or len(payload) > _MAX_PROFILE_GENERATION_BYTES:
+            raise RuntimeError("Profile generation has an invalid size")
+        return payload
+    finally:
+        os.close(fd)
+
+
+def _capture_auth_store_incarnation(
+    lock_context: _AuthStoreLockContext,
+) -> _AuthStoreIncarnation:
+    """Capture the no-follow identity owned by one frozen auth transaction."""
+    profile_home = lock_context.active_path.parent
+    info = os.stat(profile_home, follow_symlinks=False)
+    if not stat.S_ISDIR(info.st_mode):
+        raise RuntimeError("Auth store parent must be a real Profile directory")
+    return _AuthStoreIncarnation(
+        profile_home=profile_home,
+        directory_identity=(int(info.st_dev), int(info.st_ino)),
+        generation=_read_auth_profile_generation_token(profile_home),
+    )
+
+
+def _auth_store_incarnation_matches(
+    auth_path: Path,
+    incarnation: _AuthStoreIncarnation,
+) -> bool:
+    """Return whether *auth_path* still names the captured Profile incarnation."""
+    profile_home = Path(auth_path).parent
+    try:
+        if profile_home.absolute() != incarnation.profile_home.absolute():
+            return False
+        info = os.stat(profile_home, follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode):
+            return False
+        if (int(info.st_dev), int(info.st_ino)) != incarnation.directory_identity:
+            return False
+        if incarnation.generation is not None:
+            return (
+                _read_auth_profile_generation_token(profile_home)
+                == incarnation.generation
+            )
+        return True
+    except (OSError, RuntimeError):
+        return False
+
+
+def _snapshot_auth_active_provider(
+    auth_path: Path,
+) -> Any:
+    """Read ``active_provider`` from one explicitly frozen auth store."""
+    with _auth_store_lock(target_path=auth_path):
+        store = _load_auth_store()
+        return store.get("active_provider", _AUTH_ACTIVE_PROVIDER_MISSING)
+
+
+def _compare_restore_auth_active_provider(
+    auth_path: Path,
+    *,
+    expected: Any,
+    prior: Any,
+    incarnation: Optional[_AuthStoreIncarnation] = None,
+) -> bool:
+    """Restore a prior provider iff the frozen store still contains *expected*.
+
+    A concurrent provider choice wins: if the value no longer matches the
+    temporary value installed by the caller, this helper leaves it untouched.
+    """
+    with _auth_store_lock(target_path=auth_path):
+        if incarnation is not None and not _auth_store_incarnation_matches(
+            auth_path, incarnation
+        ):
+            return False
+        store = _load_auth_store()
+        current = store.get("active_provider", _AUTH_ACTIVE_PROVIDER_MISSING)
+        if current != expected:
+            return False
+        if prior is _AUTH_ACTIVE_PROVIDER_MISSING:
+            store.pop("active_provider", None)
+        else:
+            store["active_provider"] = prior
+        _save_auth_store(store, target_path=auth_path)
+        return True
 
 
 def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
-    auth_file = auth_file or _auth_file_path()
+    if auth_file is None:
+        context = _current_auth_store_context()
+        auth_file = context.active_path if context is not None else _auth_file_path()
     if not auth_file.exists():
         return {"version": AUTH_STORE_VERSION, "providers": {}}
 
@@ -1325,7 +1561,11 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     # specific store — e.g. the global-root write-through for rotating xAI
     # OAuth grants (#43589) — reusing this function's atomic O_EXCL + 0o600
     # write so the root auth.json gets the same TOCTOU-safe treatment.
-    auth_file = target_path if target_path is not None else _auth_file_path()
+    if target_path is not None:
+        auth_file = target_path
+    else:
+        context = _current_auth_store_context()
+        auth_file = context.active_path if context is not None else _auth_file_path()
     auth_file.parent.mkdir(parents=True, exist_ok=True)
     # Tighten parent dir to 0o700 so siblings can't traverse to creds.
     # No-op on Windows (POSIX mode bits not enforced); ignore failures.
@@ -1373,26 +1613,57 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     return auth_file
 
 
-def _load_provider_state_with_source(
+def _load_provider_state_from_paths(
     auth_store: Dict[str, Any],
     provider_id: str,
+    *,
+    active_path: Path,
+    global_path: Optional[Path],
 ) -> tuple[Optional[Dict[str, Any]], Optional[Path]]:
-    """Return a provider state plus the auth.json path it came from.
-
-    Most callers only need the state, but refresh paths that rotate single-use
-    OAuth refresh tokens must write the updated token chain back to the same
-    store they read. In profile mode ``_load_provider_state`` can read a
-    global-root fallback state; persisting a rotated Nous refresh token only to
-    the profile would leave the global/root store stale and cause the next
-    process to replay an already-consumed refresh token.
-    """
+    """Resolve provider state from one immutable active/global path snapshot."""
     providers = auth_store.get("providers")
     if isinstance(providers, dict):
         state = providers.get(provider_id)
         if isinstance(state, dict):
-            return dict(state), _auth_file_path()
+            return dict(state), active_path
 
+    if global_path is not None:
+        try:
+            global_store = _load_auth_store(global_path)
+        except Exception:
+            global_store = {}
+        if global_store:
+            global_providers = global_store.get("providers")
+            if isinstance(global_providers, dict):
+                global_state = global_providers.get(provider_id)
+                if isinstance(global_state, dict):
+                    return dict(global_state), global_path
+    return None, None
+
+
+def _load_provider_state_with_source(
+    auth_store: Dict[str, Any],
+    provider_id: str,
+) -> tuple[Optional[Dict[str, Any]], Optional[Path]]:
+    """Return provider state plus its active/global source path."""
+    context = _current_auth_store_context()
+    if context is not None:
+        return _load_provider_state_from_paths(
+            auth_store,
+            provider_id,
+            active_path=context.active_path,
+            global_path=context.global_path,
+        )
+
+    active_path = _auth_file_path()
     global_path = _global_auth_file_path()
+    providers = auth_store.get("providers")
+    if isinstance(providers, dict):
+        state = providers.get(provider_id)
+        if isinstance(state, dict):
+            return dict(state), active_path
+
+    # Preserve the existing read-side pytest guard and malformed-file behavior.
     global_store = _load_global_auth_store()
     if global_store:
         global_providers = global_store.get("providers")
@@ -1405,33 +1676,19 @@ def _load_provider_state_with_source(
 
 @contextmanager
 def _provider_state_transaction(provider_id: str):
-    """Lock the active auth store and any global fallback source in order.
+    """Resolve provider state under one predeclared active/global transaction.
 
-    Profile-backed refresh paths must take the global auth-store lock before
-    any provider-specific shared-store lock. Re-reading the source after the
-    target lock is acquired prevents both stale refreshes and whole-file lost
-    updates without inverting the documented auth -> shared lock order.
+    Profile-backed refresh paths freeze and lock both possible auth stores
+    before reading either one. This preserves the upstream transaction API
+    while enforcing Profile-lock-before-auth-lock ordering and preventing a
+    dynamic second-store acquisition after the active store is locked.
     """
-    with _auth_store_lock():
+    with _auth_store_lock(include_global_root=True):
         auth_store = _load_auth_store()
         state, source_path = _load_provider_state_with_source(
-            auth_store,
-            provider_id,
+            auth_store, provider_id
         )
-        active_path = _auth_file_path()
-        if source_path is None or _same_path(source_path, active_path):
-            yield auth_store, state, source_path
-            return
-
-        with _auth_store_lock(target_path=source_path):
-            source_store = _load_auth_store(source_path)
-            source_providers = source_store.get("providers")
-            source_state = None
-            if isinstance(source_providers, dict):
-                raw_state = source_providers.get(provider_id)
-                if isinstance(raw_state, dict):
-                    source_state = dict(raw_state)
-            yield auth_store, source_state, source_path
+        yield auth_store, state, source_path
 
 
 def _load_provider_state(auth_store: Dict[str, Any], provider_id: str) -> Optional[Dict[str, Any]]:
@@ -1465,7 +1722,8 @@ def _save_provider_state_to_source(
     source_path: Optional[Path],
 ) -> None:
     """Persist provider state back to the auth store it was read from."""
-    active_path = _auth_file_path()
+    context = _current_auth_store_context()
+    active_path = context.active_path if context is not None else _auth_file_path()
     if source_path is None:
         source_path = active_path
     try:
@@ -1509,7 +1767,21 @@ def _persist_provider_state_to_store(
     set_active: bool = False,
 ) -> Path:
     """Merge one provider into a specific auth store under that store's lock."""
-    with _auth_store_lock(target_path=target_path):
+    target_path = Path(target_path)
+    current_context = _current_auth_store_context()
+    target_is_prelocked = current_context is not None and any(
+        candidate is not None and _same_path(target_path, candidate)
+        for candidate in (
+            current_context.active_path,
+            current_context.global_path,
+        )
+    )
+    lock_context = (
+        nullcontext(current_context)
+        if target_is_prelocked
+        else _auth_store_lock(target_path=target_path)
+    )
+    with lock_context:
         auth_store = _load_auth_store(target_path)
         _store_provider_state(
             auth_store,
@@ -1710,7 +1982,13 @@ def write_credential_pool(
     merge does not resurrect them from the on-disk copy.
     """
     removed = {rid for rid in (removed_ids or ()) if rid}
-    with _auth_store_lock():
+    current_context = _current_auth_store_context()
+    lock_context = (
+        nullcontext(current_context)
+        if current_context is not None
+        else _auth_store_lock()
+    )
+    with lock_context:
         auth_store = _load_auth_store()
         pool = auth_store.get("credential_pool")
         if not isinstance(pool, dict):
@@ -1958,44 +2236,45 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
     return False
 
 
-def clear_provider_auth(provider_id: Optional[str] = None) -> bool:
-    """
-    Clear auth state for a provider. Used by `hermes logout`.
-    If provider_id is None, clears the active provider.
-    Returns True if something was cleared.
-    """
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
-        target = provider_id or auth_store.get("active_provider")
-        if not target:
-            return False
+def _clear_provider_auth_locked(
+    auth_store: Dict[str, Any], provider_id: Optional[str] = None
+) -> bool:
+    """Private provider cleanup; caller owns the immutable auth transaction."""
+    target = provider_id or auth_store.get("active_provider")
+    if not target:
+        return False
 
-        providers = auth_store.get("providers", {})
-        if not isinstance(providers, dict):
-            providers = {}
-            auth_store["providers"] = providers
+    providers = auth_store.get("providers", {})
+    if not isinstance(providers, dict):
+        providers = {}
+        auth_store["providers"] = providers
 
-        pool = auth_store.get("credential_pool")
-        if not isinstance(pool, dict):
-            pool = {}
-            auth_store["credential_pool"] = pool
+    pool = auth_store.get("credential_pool")
+    if not isinstance(pool, dict):
+        pool = {}
+        auth_store["credential_pool"] = pool
 
-        cleared = False
-        if target in providers:
-            del providers[target]
-            cleared = True
-        if target in pool:
-            del pool[target]
-            cleared = True
+    cleared = False
+    if target in providers:
+        del providers[target]
+        cleared = True
+    if target in pool:
+        del pool[target]
+        cleared = True
 
-        if auth_store.get("active_provider") == target:
-            auth_store["active_provider"] = None
-            cleared = True
+    if auth_store.get("active_provider") == target:
+        auth_store["active_provider"] = None
+        cleared = True
 
-        if not cleared:
-            return False
+    if cleared:
         _save_auth_store(auth_store)
-    return True
+    return cleared
+
+
+def clear_provider_auth(provider_id: Optional[str] = None) -> bool:
+    """Clear one provider under the active Profile auth transaction."""
+    with _auth_store_lock():
+        return _clear_provider_auth_locked(_load_auth_store(), provider_id)
 
 
 def deactivate_provider() -> None:
@@ -4589,45 +4868,24 @@ def _profile_has_own_xai_oauth_state(auth_store: Dict[str, Any]) -> bool:
     return isinstance(providers, dict) and isinstance(providers.get("xai-oauth"), dict)
 
 
-def _write_through_xai_oauth_to_global_root(state: Dict[str, Any]) -> None:
-    """Persist a rotated xAI OAuth ``state`` into the global-root auth.json.
+def _write_through_xai_oauth_to_global_root(
+    state: Dict[str, Any], global_path: Optional[Path]
+) -> None:
+    """Write rotated xAI state to an already-locked global auth path.
 
-    Best-effort write-through for the multi-profile rotation hazard (#43589):
-    xAI rotates the refresh_token on every refresh, so when a profile session
-    refreshes a grant it resolved from the root fallback, the rotated chain
-    must land back in root. Otherwise root keeps a now-revoked refresh token
-    and every other profile reading the stale root grant dies with
-    ``invalid_grant`` once its access token expires.
-
-    Only updates ``providers.xai-oauth`` in the root store; never touches the
-    profile store (the caller already saved that). Swallows all errors — a
-    failed write-through degrades to the pre-existing behavior (root stale),
-    it must never break the profile's own successful save.
+    The caller must obtain ``_auth_store_lock(include_global_root=True)`` and
+    pass the immutable ``context.global_path``.  Errors remain best-effort so
+    a root mirror failure does not invalidate the already-published profile
+    state.
     """
-    global_path = _global_auth_file_path()
     if global_path is None:
-        # Classic mode (profile == root); the profile save already hit root.
         return
-    # Seat belt: under pytest, refuse to write the real user's
-    # ~/.hermes/auth.json even when HERMES_HOME points at a profile path
-    # (mirrors the read-side guard in _load_global_auth_store). Uses the
-    # unmodified HOME env, not Path.home() which fixtures may monkeypatch.
-    if os.environ.get("PYTEST_CURRENT_TEST"):
-        real_home_env = os.environ.get("HOME", "")
-        if real_home_env:
-            real_root = Path(real_home_env) / ".hermes" / "auth.json"
-            try:
-                if global_path.resolve(strict=False) == real_root.resolve(strict=False):
-                    return
-            except Exception:
-                return
     try:
-        _persist_provider_state_to_store(
-            "xai-oauth",
-            state,
-            global_path,
-            set_active=False,
-        )
+        global_store = _load_auth_store(global_path) if global_path.exists() else {}
+        if not isinstance(global_store, dict):
+            return
+        _store_provider_state(global_store, "xai-oauth", dict(state), set_active=False)
+        _save_auth_store(global_store, target_path=global_path)
     except Exception as exc:  # pragma: no cover - best effort
         logger.debug("xAI OAuth: write-through to global root failed: %s", exc)
 
@@ -4651,23 +4909,22 @@ def _save_xai_oauth_tokens(
     """
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    with _auth_store_lock(include_global_root=True) as lock_context:
+        auth_store = _load_auth_store(lock_context.active_path)
         # A profile that lacks its own xai-oauth block is reading the root
-        # grant through _load_provider_state's fallback. When such a profile
-        # refreshes the (rotating) grant, we must write the rotated chain back
-        # to root too, or root is left holding a revoked refresh token (#43589).
-        # #74339: the old key-presence check (_profile_has_own_xai_oauth_state)
-        # decided write-through based on whether the profile had a
-        # providers.xai-oauth key BEFORE the save — but _store_provider_state
-        # unconditionally creates that key below. Use
-        # _load_provider_state_with_source to learn where the grant was
-        # resolved from and write back only to that source.
-        state, source_path = _load_provider_state_with_source(
-            auth_store, "xai-oauth"
+        # grant through fallback. Both stores were fixed and locked before
+        # this decision, so delete/rename or Profile switching cannot split
+        # the read and write identities. Determine the source from that frozen
+        # snapshot before mutating either store, so root-owned rotating grants
+        # are written back to root only and never create a shadowing Profile
+        # provider block (#43589, #74339).
+        state, source_path = _load_provider_state_from_paths(
+            auth_store,
+            "xai-oauth",
+            active_path=lock_context.active_path,
+            global_path=lock_context.global_path,
         )
-        if state is None:
-            state = {}
+        state = state or {}
         state["tokens"] = tokens
         state["last_refresh"] = last_refresh
         state["auth_mode"] = auth_mode
@@ -4675,24 +4932,28 @@ def _save_xai_oauth_tokens(
             state["discovery"] = discovery
         if redirect_uri:
             state["redirect_uri"] = redirect_uri
-        global_root = _global_auth_file_path()
         is_from_root = bool(
             source_path is not None
-            and global_root is not None
-            and _same_path(source_path, global_root)
+            and lock_context.global_path is not None
+            and source_path.resolve(strict=False)
+            == lock_context.global_path.resolve(strict=False)
         )
         if is_from_root:
             # Grant was resolved from root — write back to root only.
             # Do NOT call _store_provider_state on the profile auth_store
             # (it would create a shadowing providers.xai-oauth key that
             # disables write-through on the next refresh — #74339).
-            _write_through_xai_oauth_to_global_root(state)
+            _write_through_xai_oauth_to_global_root(
+                state, lock_context.global_path
+            )
         else:
             # Profile genuinely owns this — write to profile store.
             _store_provider_state(
                 auth_store, "xai-oauth", state, set_active=set_active
             )
-            _save_auth_store(auth_store)
+            _save_auth_store(
+                auth_store, target_path=lock_context.active_path
+            )
 
 
 def _xai_access_token_is_expiring(access_token: str, skew_seconds: int = 0) -> bool:
@@ -5935,7 +6196,6 @@ def resolve_nous_access_token(
         state,
         state_source_path,
     ):
-
         if not state:
             raise AuthError(
                 "Hermes is not logged into Nous Portal.",
@@ -6281,7 +6541,6 @@ def resolve_nous_runtime_credentials(
         state,
         state_source_path,
     ):
-
         if not state:
             raise AuthError("Hermes is not logged into Nous Portal.",
                             provider="nous", relogin_required=True)
@@ -7335,62 +7594,49 @@ def _update_config_for_provider(
     inference_base_url: str,
     default_model: Optional[str] = None,
 ) -> Path:
-    """Update config.yaml and auth.json to reflect the active provider.
+    """Publish active-provider auth/config state in one Profile transaction.
 
     When *default_model* is provided the function also writes it as the
-    ``model.default`` value.  This prevents a race condition where the
-    gateway (which re-reads config per-message) picks up the new provider
-    before the caller has finished model selection, resulting in a
-    mismatched model/provider (e.g. ``anthropic/claude-opus-4.6`` sent to
-    MiniMax's API).
+    ``model.default`` value. The immutable auth context fixes both paths before
+    either read or publication, preventing a profile switch between auth.json
+    and config.yaml.
     """
-    # Set active_provider in auth.json so auto-resolution picks this provider
-    with _auth_store_lock():
+    with _auth_store_lock() as lock_context:
         auth_store = _load_auth_store()
         auth_store["active_provider"] = provider_id
         _save_auth_store(auth_store)
 
-    # Update config.yaml model section
-    config_path = get_config_path()
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    require_readable_config_before_write(config_path)
+        config_path = lock_context.active_path.parent / "config.yaml"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        with _CONFIG_LOCK:
+            require_readable_config_before_write(config_path)
+            config = _read_raw_config_locked(config_path)
 
-    config = read_raw_config()
+            current_model = config.get("model")
+            if isinstance(current_model, dict):
+                model_cfg = dict(current_model)
+            elif isinstance(current_model, str) and current_model.strip():
+                model_cfg = {"default": current_model.strip()}
+            else:
+                model_cfg = {}
 
-    current_model = config.get("model")
-    if isinstance(current_model, dict):
-        model_cfg = dict(current_model)
-    elif isinstance(current_model, str) and current_model.strip():
-        model_cfg = {"default": current_model.strip()}
-    else:
-        model_cfg = {}
+            model_cfg["provider"] = provider_id
+            if inference_base_url and inference_base_url.strip():
+                model_cfg["base_url"] = inference_base_url.rstrip("/")
+            else:
+                model_cfg.pop("base_url", None)
 
-    model_cfg["provider"] = provider_id
-    if inference_base_url and inference_base_url.strip():
-        model_cfg["base_url"] = inference_base_url.rstrip("/")
-    else:
-        # Clear stale base_url to prevent contamination when switching providers
-        model_cfg.pop("base_url", None)
+            from hermes_cli.config import clear_model_endpoint_credentials
 
-    # Clear stale endpoint credentials left over from a previous custom provider.
-    # Built-in providers resolve credentials from env/auth state, not inline
-    # model.api_key.
-    from hermes_cli.config import clear_model_endpoint_credentials
+            clear_model_endpoint_credentials(model_cfg)
+            if default_model:
+                cur_default = model_cfg.get("default", "")
+                if not cur_default or "/" in cur_default:
+                    model_cfg["default"] = default_model
 
-    clear_model_endpoint_credentials(model_cfg)
-
-    # When switching to a non-OpenRouter provider, ensure model.default is
-    # valid for the new provider.  An OpenRouter-formatted name like
-    # "anthropic/claude-opus-4.6" will fail on direct-API providers.
-    if default_model:
-        cur_default = model_cfg.get("default", "")
-        if not cur_default or "/" in cur_default:
-            model_cfg["default"] = default_model
-
-    config["model"] = model_cfg
-
-    atomic_yaml_write(config_path, config, sort_keys=False)
-    return config_path
+            config["model"] = model_cfg
+            atomic_yaml_write(config_path, config, sort_keys=False)
+        return config_path
 
 
 def _get_config_provider() -> Optional[str]:
@@ -7441,24 +7687,30 @@ def _logout_default_provider_from_config() -> Optional[str]:
     return None
 
 
-def _reset_config_provider() -> Path:
-    """Reset config.yaml provider back to auto after logout."""
-    config_path = get_config_path()
+def _reset_config_provider_locked(lock_context: _AuthStoreLockContext) -> Path:
+    """Private config reset; caller owns the immutable auth/Profile transaction."""
+    config_path = lock_context.active_path.parent / "config.yaml"
     if not config_path.exists():
         return config_path
-    require_readable_config_before_write(config_path)
+    with _CONFIG_LOCK:
+        require_readable_config_before_write(config_path)
+        config = _read_raw_config_locked(config_path)
+        if not config:
+            return config_path
 
-    config = read_raw_config()
-    if not config:
-        return config_path
-
-    model = config.get("model")
-    if isinstance(model, dict):
-        model["provider"] = "auto"
-        if "base_url" in model:
-            model["base_url"] = OPENROUTER_BASE_URL
-    atomic_yaml_write(config_path, config, sort_keys=False)
+        model = config.get("model")
+        if isinstance(model, dict):
+            model["provider"] = "auto"
+            if "base_url" in model:
+                model["base_url"] = OPENROUTER_BASE_URL
+        atomic_yaml_write(config_path, config, sort_keys=False)
     return config_path
+
+
+def _reset_config_provider() -> Path:
+    """Reset config.yaml provider back to auto under one Profile transaction."""
+    with _auth_store_lock() as lock_context:
+        return _reset_config_provider_locked(lock_context)
 
 
 def _confirm_selection_guards(
@@ -9080,7 +9332,7 @@ def step_up_nous_billing_scope(
 
 
 def _login_nous(args, pconfig: ProviderConfig) -> None:
-    """Nous Portal device authorization flow."""
+    """Nous Portal device authorization flow bound to its starting Profile."""
     timeout_seconds = getattr(args, "timeout", None) or 15.0
     insecure = bool(getattr(args, "insecure", False))
     ca_bundle = (
@@ -9089,8 +9341,13 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
         or os.getenv("SSL_CERT_FILE")
     )
 
+    frozen_home = get_hermes_home().resolve(strict=False)
+    scope_token = set_hermes_home_override(frozen_home)
     try:
         auth_state = None
+        with _auth_store_lock() as frozen_context:
+            frozen_auth_path = frozen_context.active_path
+            frozen_incarnation = _capture_auth_store_incarnation(frozen_context)
 
         # Codex-style auto-import: before launching a fresh device-code
         # flow, check the shared store for an existing Nous credential
@@ -9132,17 +9389,20 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
 
         inference_base_url = auth_state["inference_base_url"]
 
-        # Snapshot the prior active_provider BEFORE _save_provider_state
-        # overwrites it to "nous".  If the user picks "Skip (keep current)"
-        # during model selection below, we restore this so the user's previous
-        # provider (e.g. openrouter) is preserved.
-        with _auth_store_lock():
-            _prior_store = _load_auth_store()
-            prior_active_provider = _prior_store.get("active_provider")
-
-        with _auth_store_lock():
+        # Persist the Nous grant without changing inference routing. The active
+        # provider is promoted only after the user confirms a model below, so a
+        # Skip path needs no destructive "switch then restore" compensation.
+        with _auth_store_lock(target_path=frozen_auth_path):
+            if not _auth_store_incarnation_matches(
+                frozen_auth_path, frozen_incarnation
+            ):
+                raise RuntimeError(
+                    "Profile changed while Nous authentication was in progress"
+                )
             auth_store = _load_auth_store()
-            _save_provider_state(auth_store, "nous", auth_state)
+            _store_provider_state(
+                auth_store, "nous", auth_state, set_active=False
+            )
             saved_to = _save_auth_store(auth_store)
 
         # Mirror to the shared store so other profiles can one-tap import
@@ -9248,31 +9508,24 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
         # Write provider + model atomically so config is never mismatched.
         # If no model was selected (user picked "Skip (keep current)",
         # model list fetch failed, or no curated models were available),
-        # preserve the user's previous provider — don't silently switch
-        # them to Nous with a mismatched model.  The Nous OAuth tokens
-        # stay saved for future use.
+        # leave routing untouched; the Nous OAuth tokens remain available.
         if not selected_model:
-            # Restore the prior active_provider that _save_provider_state
-            # overwrote to "nous".  config.yaml model.provider is left
-            # untouched, so the user's previous provider is fully preserved.
-            with _auth_store_lock():
-                auth_store = _load_auth_store()
-                if prior_active_provider:
-                    auth_store["active_provider"] = prior_active_provider
-                else:
-                    auth_store.pop("active_provider", None)
-                _save_auth_store(auth_store)
             print()
             print("No provider change. Nous credentials saved for future use.")
             print("  Run `hermes model` again to switch to Nous Portal.")
             return
 
-        config_path = _update_config_for_provider(
-            "nous", inference_base_url, default_model=selected_model,
-        )
-        if selected_model:
-            _save_model_choice(selected_model)
-            print(f"Default model set to: {selected_model}")
+        with _auth_store_lock(target_path=frozen_auth_path):
+            if not _auth_store_incarnation_matches(
+                frozen_auth_path, frozen_incarnation
+            ):
+                raise RuntimeError(
+                    "Profile changed while Nous authentication was in progress"
+                )
+            config_path = _update_config_for_provider(
+                "nous", inference_base_url, default_model=selected_model,
+            )
+        print(f"Default model set to: {selected_model}")
         print(f"  Config updated: {config_path} (model.provider=nous)")
 
     except KeyboardInterrupt:
@@ -9281,29 +9534,54 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
     except Exception as exc:
         print(f"Login failed: {exc}")
         raise SystemExit(1)
+    finally:
+        reset_hermes_home_override(scope_token)
 
 
 def logout_command(args) -> None:
-    """Clear auth state for a provider."""
+    """Clear auth/config state in one immutable Profile transaction."""
     provider_id = getattr(args, "provider", None)
 
     if provider_id and not is_known_auth_provider(provider_id):
         print(f"Unknown provider: {provider_id}")
         raise SystemExit(1)
 
-    active = get_active_provider()
-    target = provider_id or active or _logout_default_provider_from_config()
+    with _auth_store_lock() as lock_context:
+        auth_store = _load_auth_store()
+        config_path = lock_context.active_path.parent / "config.yaml"
+        with _CONFIG_LOCK:
+            config = _read_raw_config_locked(config_path)
 
-    if not target:
-        print("No provider is currently logged in.")
-        return
+        model = config.get("model") if isinstance(config, dict) else None
+        configured_provider = (
+            model.get("provider").strip().lower()
+            if isinstance(model, dict)
+            and isinstance(model.get("provider"), str)
+            and model.get("provider").strip()
+            else None
+        )
+        fallback_target = (
+            configured_provider
+            if configured_provider in {"nous", "openai-codex", "xai-oauth"}
+            else None
+        )
+        target = provider_id or auth_store.get("active_provider") or fallback_target
 
-    should_reset_config = _should_reset_config_provider_on_logout(target)
-    provider_name = get_auth_provider_display_name(target)
+        if not target:
+            print("No provider is currently logged in.")
+            return
 
-    if clear_provider_auth(target) or should_reset_config:
+        normalized_target = target.strip().lower()
+        should_reset_config = (
+            normalized_target in PROVIDER_REGISTRY
+            and configured_provider == normalized_target
+        )
+        provider_name = get_auth_provider_display_name(target)
+        cleared = _clear_provider_auth_locked(auth_store, target)
         if should_reset_config:
-            _reset_config_provider()
+            _reset_config_provider_locked(lock_context)
+
+    if cleared or should_reset_config:
         print(f"Logged out of {provider_name}.")
         if should_reset_config and os.getenv("OPENROUTER_API_KEY"):
             print("Hermes will use OpenRouter for inference.")

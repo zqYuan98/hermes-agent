@@ -844,13 +844,28 @@ class TestDetectVenvDir:
 class TestSystemUnitHermesHome:
     """HERMES_HOME in system units must reference the target user, not root."""
 
-    def test_system_unit_uses_target_user_home_not_calling_user(self, monkeypatch):
-        # Simulate sudo: Path.home() returns /root, target user is alice
-        monkeypatch.setattr(Path, "home", staticmethod(lambda: Path("/root")))
+    def test_system_unit_uses_target_user_home_not_calling_user(
+        self, tmp_path, monkeypatch
+    ):
+        # Simulate sudo: Path.home() resolves to the caller while the unit and
+        # its restart timing belong to the target user's Profile.
+        root_home = tmp_path / "root"
+        root_hermes = root_home / ".hermes"
+        alice_home = tmp_path / "alice"
+        alice_hermes = alice_home / ".hermes"
+        root_hermes.mkdir(parents=True)
+        alice_hermes.mkdir(parents=True)
+        (root_hermes / "config.yaml").write_text(
+            "agent:\n  restart_drain_timeout: 7\n", encoding="utf-8"
+        )
+        (alice_hermes / "config.yaml").write_text(
+            "agent:\n  restart_drain_timeout: 123\n", encoding="utf-8"
+        )
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: root_home))
         monkeypatch.delenv("HERMES_HOME", raising=False)
         monkeypatch.setattr(
             gateway_cli, "_system_service_identity",
-            lambda run_as_user=None: ("alice", "alice", "/home/alice"),
+            lambda run_as_user=None: ("alice", "alice", str(alice_home)),
         )
         monkeypatch.setattr(
             gateway_cli, "_build_user_local_paths",
@@ -859,8 +874,9 @@ class TestSystemUnitHermesHome:
 
         unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
 
-        assert 'HERMES_HOME=/home/alice/.hermes' in unit
-        assert '/root/.hermes' not in unit
+        assert f'HERMES_HOME={alice_hermes}' in unit
+        assert "TimeoutStopSec=153" in unit
+        assert str(root_hermes) not in unit
 
 
     def test_user_unit_unaffected_by_change(self):

@@ -347,6 +347,7 @@ def _mock_vision_response():
     return SimpleNamespace(choices=[choice], model="test/vision", usage=None)
 
 
+@pytest.mark.usefixtures("stable_public_dns")
 class TestVisionDispatchLoopSafety:
     """Simulate the full registry.dispatch('vision_analyze') chain and
     verify the event loop stays alive afterwards — the exact scenario

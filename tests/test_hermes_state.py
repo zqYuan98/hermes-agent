@@ -709,39 +709,30 @@ class TestFTS5Search:
         db.append_message("s1", role="assistant", content="projectionneedle")
         db.append_message("s1", role="user", content="after")
 
-        statements = []
-        read_conn = db._get_read_conn() or db._conn
-        traced_connections = [db._conn]
-        if read_conn is not db._conn:
-            traced_connections.append(read_conn)
-        for conn in traced_connections:
-            conn.set_trace_callback(statements.append)
-
-        def context_query_count():
-            normalized = (" ".join(sql.upper().split()) for sql in statements)
-            return sum("WITH TARGET AS (" in sql for sql in normalized)
-
-        try:
+        with mock.patch.object(db, "_read_ctx", wraps=db._read_ctx) as read_ctx:
             projected = db.search_messages(
                 "projectionneedle", fields=("session_id", "snippet")
             )
             assert len(projected) == 1
-            assert context_query_count() == 0
+            projected_reads = read_ctx.call_count
 
             full = db.search_messages(
                 "projectionneedle", fields=("session_id", "context")
             )
             assert len(full) == 1
             assert full[0]["context"]
-            assert context_query_count() == 1
+            full_reads = read_ctx.call_count - projected_reads
 
             default = db.search_messages("projectionneedle")
             assert len(default) == 1
             assert default[0]["context"]
-            assert context_query_count() == 2
-        finally:
-            for conn in traced_connections:
-                conn.set_trace_callback(None)
+            default_reads = read_ctx.call_count - projected_reads - full_reads
+
+        # All three searches execute the same base FTS/read path. Selecting
+        # context adds exactly one fresh read transaction per match; a
+        # projection that omits context must skip that enrichment query.
+        assert full_reads == projected_reads + 1
+        assert default_reads == projected_reads + 1
 
     def test_sanitize_fts5_query_strips_dangerous_chars(self):
         """Unit test for _sanitize_fts5_query static method."""

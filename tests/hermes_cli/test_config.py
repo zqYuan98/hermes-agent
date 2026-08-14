@@ -39,6 +39,186 @@ class TestGetHermesHome:
             assert home == Path.home() / ".hermes"
 
 
+class TestProfileMutationLockCoverage:
+    @staticmethod
+    def _install_profile_lock_probe(monkeypatch, cfg_mod, expected_home: Path):
+        import contextlib
+
+        state = {"held": 0, "homes": []}
+
+        @contextlib.contextmanager
+        def fake_lock(home, **_kwargs):
+            resolved = Path(home).resolve()
+            assert resolved == expected_home.resolve()
+            state["homes"].append(resolved)
+            state["held"] += 1
+            try:
+                yield resolved
+            finally:
+                state["held"] -= 1
+
+        monkeypatch.setattr(cfg_mod, "profile_mutation_lock", fake_lock, raising=False)
+        return state
+
+    def test_ensure_home_mutations_hold_profile_lock(self, tmp_path, monkeypatch):
+        from hermes_cli import config as cfg_mod
+
+        state = self._install_profile_lock_probe(monkeypatch, cfg_mod, tmp_path)
+        original = cfg_mod._ensure_default_soul_md
+
+        def checked(home):
+            assert state["held"] == 1
+            return original(home)
+
+        monkeypatch.setattr(cfg_mod, "_ensure_default_soul_md", checked)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        cfg_mod.ensure_hermes_home()
+
+        assert state["homes"] == [tmp_path.resolve()]
+
+    def test_load_config_hidden_bootstrap_holds_profile_lock(self, tmp_path, monkeypatch):
+        from hermes_cli import config as cfg_mod
+
+        state = self._install_profile_lock_probe(monkeypatch, cfg_mod, tmp_path)
+        original = cfg_mod._ensure_default_soul_md
+
+        def checked(home):
+            assert state["held"] == 1
+            return original(home)
+
+        monkeypatch.setattr(cfg_mod, "_ensure_default_soul_md", checked)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        cfg_mod.load_config()
+
+        assert state["homes"] == [tmp_path.resolve()]
+
+    @pytest.mark.parametrize("writer", ["save_config", "atomic_config_write"])
+    def test_config_publication_holds_profile_lock(
+        self, writer, tmp_path, monkeypatch
+    ):
+        from hermes_cli import config as cfg_mod
+        import utils
+
+        state = self._install_profile_lock_probe(monkeypatch, cfg_mod, tmp_path)
+        real_atomic = utils.atomic_yaml_write
+
+        def checked_atomic(path, data, **kwargs):
+            assert state["held"] == 1
+            return real_atomic(path, data, **kwargs)
+
+        monkeypatch.setattr(utils, "atomic_yaml_write", checked_atomic)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        if writer == "save_config":
+            cfg_mod.save_config({"model": "test/model"})
+        else:
+            cfg_mod.atomic_config_write(
+                tmp_path / "config.yaml", {"model": "test/model"}
+            )
+
+        assert state["homes"] == [tmp_path.resolve()]
+
+    @pytest.mark.parametrize("writer", ["save", "remove", "sanitize"])
+    def test_env_publication_holds_profile_lock(
+        self, writer, tmp_path, monkeypatch
+    ):
+        from hermes_cli import config as cfg_mod
+
+        state = self._install_profile_lock_probe(monkeypatch, cfg_mod, tmp_path)
+        real_replace = cfg_mod.atomic_replace
+
+        def checked_replace(src, dst):
+            assert state["held"] == 1
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(cfg_mod, "atomic_replace", checked_replace)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        env_path = tmp_path / ".env"
+        if writer == "remove":
+            env_path.write_text("DROP=value\nKEEP=value\n", encoding="utf-8")
+            cfg_mod.remove_env_value("DROP")
+        elif writer == "sanitize":
+            env_path.write_text(
+                "OPENROUTER_API_KEY=valFIRECRAWL_API_KEY=val2\n",
+                encoding="utf-8",
+            )
+            cfg_mod.sanitize_env_file()
+        else:
+            cfg_mod.save_env_value("TEST_PROFILE_LOCK_KEY", "value")
+
+        assert state["homes"] == [tmp_path.resolve()]
+
+    def test_profile_lock_is_outer_to_config_rmw_lock(self, tmp_path, monkeypatch):
+        from hermes_cli import config as cfg_mod
+        import contextlib
+
+        state = {"profile": 0, "config": 0}
+
+        @contextlib.contextmanager
+        def fake_profile_lock(home, **_kwargs):
+            assert Path(home).resolve() == tmp_path.resolve()
+            assert state["config"] == 0
+            state["profile"] += 1
+            try:
+                yield Path(home).resolve()
+            finally:
+                state["profile"] -= 1
+
+        class CheckedConfigLock:
+            def __enter__(self):
+                assert state["profile"] == 1
+                state["config"] += 1
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                state["config"] -= 1
+                return False
+
+        monkeypatch.setattr(cfg_mod, "profile_mutation_lock", fake_profile_lock, raising=False)
+        monkeypatch.setattr(cfg_mod, "_CONFIG_LOCK", CheckedConfigLock())
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        cfg_mod.save_config({"model": "test/model"})
+
+        assert state == {"profile": 0, "config": 0}
+
+    def test_set_config_value_holds_one_profile_lock_across_config_and_env(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import config as cfg_mod
+        import utils
+
+        state = self._install_profile_lock_probe(monkeypatch, cfg_mod, tmp_path)
+        real_yaml_write = utils.atomic_yaml_write
+        real_replace = cfg_mod.atomic_replace
+
+        def checked_yaml_write(path, data, **kwargs):
+            assert state["held"] == 1
+            return real_yaml_write(path, data, **kwargs)
+
+        def checked_replace(src, dst):
+            assert state["held"] == 1
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(utils, "atomic_yaml_write", checked_yaml_write)
+        monkeypatch.setattr(cfg_mod, "atomic_replace", checked_replace)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        cfg_mod.set_config_value(
+            "terminal.docker_mount_cwd_to_workspace", "true"
+        )
+
+        assert state["homes"] == [tmp_path.resolve()]
+        assert (tmp_path / "config.yaml").is_file()
+        env_text = (tmp_path / ".env").read_text(encoding="utf-8")
+        assert (
+            "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE=true" in env_text
+            or "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE=True" in env_text
+        )
+
+
 class TestEnsureHermesHome:
 
     def test_creates_default_soul_md_if_missing(self, tmp_path):

@@ -48,6 +48,7 @@ from hermes_cli.config import (
     is_managed,
     managed_error,
     read_raw_config,
+    read_raw_config_readonly,
     save_env_value,
     write_platform_config_field,
 )
@@ -2969,16 +2970,32 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         "/sbin",
         "/bin",
     ]
+    if system:
+        username, group_name, home_dir = _system_service_identity(run_as_user)
+        hermes_home = _hermes_home_for_target_user(home_dir)
+        # A system unit belongs to the TARGET user, not the sudo caller. Read
+        # restart timing from that Profile without mutating process-global
+        # HERMES_HOME; the ContextVar also keeps concurrent profile work scoped.
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        home_token = set_hermes_home_override(hermes_home)
+        try:
+            _drain_timeout = int(_get_restart_drain_timeout() or 0)
+        finally:
+            reset_hermes_home_override(home_token)
+    else:
+        _drain_timeout = int(_get_restart_drain_timeout() or 0)
+
     # Preserve 30s for post-drain cleanup before systemd escalates, with a
     # 60s minimum for installs that use the default immediate drain. Positive
     # drain values extend the deadline directly instead of inheriting a second
     # 60s floor, so a configured 45s drain yields 75s rather than 90s.
-    _drain_timeout = int(_get_restart_drain_timeout() or 0)
     restart_timeout = max(60, _drain_timeout + 30)
 
     if system:
-        username, group_name, home_dir = _system_service_identity(run_as_user)
-        hermes_home = _hermes_home_for_target_user(home_dir)
         systemd_type, systemd_watchdog_directives = _systemd_watchdog_service_fields(
             hermes_home
         )
@@ -3382,10 +3399,15 @@ def _print_system_scope_remediation(action: str) -> None:
 
 
 def _get_restart_drain_timeout() -> float:
-    """Return the configured gateway restart drain timeout in seconds."""
+    """Return the configured gateway restart drain timeout in seconds.
+
+    This is a read-only service-definition/runtime probe.  Use the readonly
+    config cache so generating a system unit for another user does not create a
+    Profile mutation lock under the sudo caller's Hermes root.
+    """
     raw = os.getenv("HERMES_RESTART_DRAIN_TIMEOUT", "").strip()
     if not raw:
-        cfg = read_raw_config()
+        cfg = read_raw_config_readonly()
         agent_cfg = cfg.get("agent", {}) if isinstance(cfg, dict) else {}
         raw = str(
             agent_cfg.get(

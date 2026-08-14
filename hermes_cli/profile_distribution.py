@@ -71,6 +71,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.skill_utils import is_excluded_skill_path
+from hermes_constants import get_default_hermes_root, profile_mutation_locks
 from hermes_cli._subprocess_compat import noninteractive_git_env
 
 
@@ -100,7 +101,7 @@ DEFAULT_DIST_OWNED: Tuple[str, ...] = (
 # convention for user customizations.
 USER_OWNED_EXCLUDE: frozenset = frozenset({
     # Credentials & runtime secrets
-    "auth.json", ".env",
+    "auth.json", ".env", ".webui-profile-generation",
     # Databases & runtime state
     "state.db", "state.db-shm", "state.db-wal",
     "hermes_state.db", "response_store.db",
@@ -251,6 +252,13 @@ def _load_yaml(text: str) -> Any:
     return yaml.safe_load(text)
 
 
+def _dump_yaml(data: Any) -> str:
+    """Compatibility helper for callers that serialize manifests."""
+    import yaml
+
+    return yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
+
+
 def read_manifest(profile_dir: Path) -> Optional[DistributionManifest]:
     """Return the manifest for *profile_dir*, or None if it isn't a distribution."""
     mf_path = profile_dir / MANIFEST_FILENAME
@@ -265,21 +273,11 @@ def read_manifest(profile_dir: Path) -> Optional[DistributionManifest]:
 
 def write_manifest(profile_dir: Path, manifest: DistributionManifest) -> Path:
     mf_path = profile_dir / MANIFEST_FILENAME
-    # Route through the shared atomic YAML writer (temp file + fsync + atomic
-    # replace, preserving mode/owner and symlinks). A bare write_text()
-    # truncates distribution.yaml before the dump lands, and read_manifest()
-    # treats a missing-or-unparseable manifest as "not a distribution" -- so an
-    # interrupted install/update silently demotes the profile, losing update
-    # tracking and env_requires with no error surfaced anywhere.
+    # Publish the manifest atomically so an interrupted update cannot leave the
+    # Profile looking like a non-distribution.  Existing mode/owner/symlink
+    # semantics are handled by the shared writer.
     from utils import atomic_yaml_write
 
-    # create_mode=0o644: _materialize() reaches this line with no manifest on
-    # disk whenever a distribution declares an explicit `distribution_owned`
-    # allowlist that does not list distribution.yaml itself, so the file is
-    # never copied out of the staged tree. The manifest is a shareable
-    # descriptor rather than a secret and used to land at the umask default,
-    # so don't leave a freshly created one at mkstemp's 0600. An existing
-    # file's mode is preserved as before.
     atomic_yaml_write(
         mf_path,
         manifest.to_dict(),
@@ -602,12 +600,12 @@ def _copy_dist_payload(
     explicit_owned = [p for p in explicit_owned if p]
 
     if explicit_owned:
-        # Path-aware allowlist: copy exactly the declared paths.
         for rel in explicit_owned:
-            rel_parts = PurePosixPath(rel).parts
+            rel_path = PurePosixPath(rel)
+            rel_parts = rel_path.parts
             if not rel_parts or rel_parts[0] in USER_OWNED_EXCLUDE:
                 continue
-            if ".." in rel_parts or PurePosixPath(rel).is_absolute():
+            if ".." in rel_parts or rel_path.is_absolute():
                 continue
             src = staged.joinpath(*rel_parts)
             if not src.exists():
@@ -617,38 +615,36 @@ def _copy_dist_payload(
                 if name == ENV_TEMPLATE_FILENAME:
                     shutil.copy2(src, target / ENV_EXAMPLE_FILENAME)
                     continue
-                if name == "config.yaml" and preserve_config and (target / "config.yaml").exists():
-                    # Leave user's config.yaml alone on update
+                if (
+                    name == "config.yaml"
+                    and preserve_config
+                    and (target / "config.yaml").exists()
+                ):
                     continue
             dest = target.joinpath(*rel_parts)
             dest.parent.mkdir(parents=True, exist_ok=True)
             _copy_entry(src, dest)
     else:
-        # Legacy behaviour: no explicit allowlist means the whole staged
-        # payload (minus USER_OWNED_EXCLUDE) is distribution-owned.  Do NOT
-        # narrow to DEFAULT_DIST_OWNED here — existing distributions ship
-        # arbitrary extra top-level paths without declaring them.
         for entry in staged.iterdir():
             name = entry.name
-
             if name in USER_OWNED_EXCLUDE:
                 continue
             if name == ENV_TEMPLATE_FILENAME:
                 shutil.copy2(entry, target / ENV_EXAMPLE_FILENAME)
                 continue
-            if name == "config.yaml" and preserve_config and (target / "config.yaml").exists():
-                # Leave user's config.yaml alone on update
+            if (
+                name == "config.yaml"
+                and preserve_config
+                and (target / "config.yaml").exists()
+            ):
                 continue
-
             _copy_entry(entry, target / name)
 
-    # Emit .env.EXAMPLE from manifest if the staged tree didn't ship one
     if manifest.env_requires and not (target / ENV_EXAMPLE_FILENAME).exists():
         (target / ENV_EXAMPLE_FILENAME).write_text(
             _env_template_from_manifest(manifest), encoding="utf-8"
         )
 
-    # Make sure the manifest on disk reflects resolved name + source
     write_manifest(target, manifest)
 
 
@@ -676,30 +672,42 @@ def install_distribution(
     )
 
     with tempfile.TemporaryDirectory(prefix="hermes_dist_install_") as tmp:
+        # Source resolution, git/network I/O, validation and staging are private
+        # preparation and deliberately do not hold live Profile locks.
         plan = plan_install(source, Path(tmp), override_name=name)
+        root = get_default_hermes_root()
 
-        if plan.existing and not force:
-            raise DistributionError(
-                f"Profile '{plan.manifest.name}' already exists at {plan.target_dir}. "
-                "Use `hermes profile update` to upgrade in place, "
-                "or pass --force to overwrite."
+        # Publication is one root+target transaction.  Recompute existence here
+        # because plan.existing was only an unlocked preview.
+        with profile_mutation_locks((root, plan.target_dir)):
+            if plan.target_dir.exists() and not plan.target_dir.is_dir():
+                raise DistributionError(
+                    f"Profile target is not a directory: {plan.target_dir}"
+                )
+            plan.existing = plan.target_dir.is_dir()
+            if plan.existing and not force:
+                raise DistributionError(
+                    f"Profile '{plan.manifest.name}' already exists at {plan.target_dir}. "
+                    "Use `hermes profile update` to upgrade in place, "
+                    "or pass --force to overwrite."
+                )
+
+            # Fresh install: config.yaml comes from the distribution.  Force
+            # reinstall preserves user-owned paths and the target incarnation.
+            _bootstrap_user_dirs(plan.target_dir)
+            _copy_dist_payload(
+                plan.staged_dir,
+                plan.target_dir,
+                plan.manifest,
+                preserve_config=False,
             )
 
-        # Fresh install: config.yaml comes from the distribution.
-        _bootstrap_user_dirs(plan.target_dir)
-        _copy_dist_payload(
-            plan.staged_dir,
-            plan.target_dir,
-            plan.manifest,
-            preserve_config=False,
-        )
+            if create_alias:
+                collision = check_alias_collision(plan.manifest.name)
+                if collision is None:
+                    create_wrapper_script(plan.manifest.name)
 
-        if create_alias:
-            collision = check_alias_collision(plan.manifest.name)
-            if collision is None:
-                create_wrapper_script(plan.manifest.name)
-
-        return plan
+            return plan
 
 
 def update_distribution(
@@ -722,36 +730,66 @@ def update_distribution(
     canon = normalize_profile_name(profile_name)
     validate_profile_name(canon)
     target = get_profile_dir(canon)
-    if not target.is_dir():
-        raise DistributionError(f"Profile '{canon}' does not exist.")
+    root = get_default_hermes_root()
+    manifest_path = target / MANIFEST_FILENAME
 
-    existing_manifest = read_manifest(target)
-    if existing_manifest is None:
-        raise DistributionError(
-            f"Profile '{canon}' is not a distribution (no {MANIFEST_FILENAME}). "
-            "Only profiles installed via `hermes profile install` can be updated."
-        )
-    if not existing_manifest.source:
-        raise DistributionError(
-            f"Profile '{canon}' has no recorded source.  Re-install with "
-            "`hermes profile install <source> --name {canon} --force`."
-        )
+    # Capture a stable incarnation + source snapshot.  Do not hold these locks
+    # while cloning/downloading the update.
+    with profile_mutation_locks((root, target)):
+        if not target.is_dir():
+            raise DistributionError(f"Profile '{canon}' does not exist.")
+        target_stat = target.stat()
+        try:
+            manifest_bytes = manifest_path.read_bytes()
+        except FileNotFoundError:
+            raise DistributionError(
+                f"Profile '{canon}' is not a distribution (no {MANIFEST_FILENAME}). "
+                "Only profiles installed via `hermes profile install` can be updated."
+            ) from None
+        existing_manifest = read_manifest(target)
+        if existing_manifest is None:
+            raise DistributionError(
+                f"Profile '{canon}' is not a distribution (no {MANIFEST_FILENAME}). "
+                "Only profiles installed via `hermes profile install` can be updated."
+            )
+        if not existing_manifest.source:
+            raise DistributionError(
+                f"Profile '{canon}' has no recorded source.  Re-install with "
+                "`hermes profile install <source> --name {canon} --force`."
+            )
+        source = existing_manifest.source
+        incarnation = (target_stat.st_dev, target_stat.st_ino)
 
     with tempfile.TemporaryDirectory(prefix="hermes_dist_update_") as tmp:
-        plan = plan_install(
-            existing_manifest.source,
-            Path(tmp),
-            override_name=canon,
-        )
+        plan = plan_install(source, Path(tmp), override_name=canon)
         plan.preserves_config = not force_config
 
-        _copy_dist_payload(
-            plan.staged_dir,
-            plan.target_dir,
-            plan.manifest,
-            preserve_config=plan.preserves_config,
-        )
-        return plan
+        with profile_mutation_locks((root, target)):
+            if not target.is_dir():
+                raise DistributionError(
+                    f"Profile '{canon}' changed while update was staged; retry."
+                )
+            current_stat = target.stat()
+            current_incarnation = (current_stat.st_dev, current_stat.st_ino)
+            try:
+                current_manifest_bytes = manifest_path.read_bytes()
+            except FileNotFoundError:
+                current_manifest_bytes = None
+            if (
+                current_incarnation != incarnation
+                or current_manifest_bytes != manifest_bytes
+            ):
+                raise DistributionError(
+                    f"Profile '{canon}' changed while update was staged; retry."
+                )
+
+            _copy_dist_payload(
+                plan.staged_dir,
+                plan.target_dir,
+                plan.manifest,
+                preserve_config=plan.preserves_config,
+            )
+            return plan
 
 
 # ---------------------------------------------------------------------------

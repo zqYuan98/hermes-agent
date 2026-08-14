@@ -218,6 +218,57 @@ class TestLooksLikeGitUrl:
 
 class TestInstall:
 
+    def test_install_stages_outside_then_locks_root_and_target(
+        self, profile_env, monkeypatch
+    ):
+        import contextlib
+        from hermes_cli import profile_distribution as dist
+
+        staged = _make_staging_dir(profile_env, "locked")
+        root = profile_env / ".hermes"
+        target = root / "profiles" / "installed"
+        events = []
+        lock_sets = []
+        state = {"active": False}
+        real_plan = dist.plan_install
+
+        def tracked_plan(*args, **kwargs):
+            assert not state["active"], "distribution staging held live Profile locks"
+            events.append("stage")
+            return real_plan(*args, **kwargs)
+
+        @contextlib.contextmanager
+        def tracked_locks(homes):
+            lock_sets.append(tuple(Path(home).resolve() for home in homes))
+            state["active"] = True
+            try:
+                yield
+            finally:
+                state["active"] = False
+
+        def tracked_bootstrap(profile_dir):
+            assert state["active"], "distribution bootstrap ran outside lifecycle locks"
+            assert profile_dir == target
+            events.append("bootstrap")
+
+        def tracked_copy(staged_dir, profile_dir, manifest, preserve_config):
+            assert state["active"], "distribution publication ran outside lifecycle locks"
+            assert staged_dir == staged.resolve()
+            assert profile_dir == target
+            assert preserve_config is False
+            events.append("publish")
+
+        monkeypatch.setattr(dist, "plan_install", tracked_plan)
+        monkeypatch.setattr(dist, "profile_mutation_locks", tracked_locks, raising=False)
+        monkeypatch.setattr(dist, "_bootstrap_user_dirs", tracked_bootstrap)
+        monkeypatch.setattr(dist, "_copy_dist_payload", tracked_copy)
+
+        plan = dist.install_distribution(str(staged), name="installed")
+
+        assert plan.target_dir == target
+        assert events == ["stage", "bootstrap", "publish"]
+        assert lock_sets == [(root.resolve(), target.resolve())]
+
     def test_install_from_directory(self, profile_env):
         staged = _make_staging_dir(profile_env, "src")
         plan = install_distribution(str(staged), name="installed")
@@ -375,6 +426,85 @@ class TestInstall:
 
 class TestUpdate:
 
+    def test_update_stages_outside_then_locks_root_and_target(
+        self, profile_env, monkeypatch
+    ):
+        import contextlib
+        from hermes_cli import profile_distribution as dist
+
+        staged = _make_staging_dir(profile_env, "source")
+        installed = dist.install_distribution(str(staged), name="telem")
+        root = profile_env / ".hermes"
+        target = installed.target_dir
+        events = []
+        lock_sets = []
+        state = {"active": False}
+        real_plan = dist.plan_install
+
+        def tracked_plan(*args, **kwargs):
+            assert not state["active"], "distribution staging held live Profile locks"
+            events.append("stage")
+            return real_plan(*args, **kwargs)
+
+        @contextlib.contextmanager
+        def tracked_locks(homes):
+            lock_sets.append(tuple(Path(home).resolve() for home in homes))
+            state["active"] = True
+            try:
+                yield
+            finally:
+                state["active"] = False
+
+        def tracked_copy(staged_dir, profile_dir, manifest, preserve_config):
+            assert state["active"], "distribution update ran outside lifecycle locks"
+            assert profile_dir == target
+            events.append("publish")
+
+        monkeypatch.setattr(dist, "plan_install", tracked_plan)
+        monkeypatch.setattr(dist, "profile_mutation_locks", tracked_locks, raising=False)
+        monkeypatch.setattr(dist, "_copy_dist_payload", tracked_copy)
+
+        plan = dist.update_distribution("telem")
+
+        assert plan.target_dir == target
+        assert events == ["stage", "publish"]
+        expected_locks = (root.resolve(), target.resolve())
+        assert lock_sets == [expected_locks, expected_locks]
+
+    def test_update_rejects_recreated_profile_during_staging(
+        self, profile_env, monkeypatch
+    ):
+        from hermes_cli import profile_distribution as dist
+
+        staged = _make_staging_dir(profile_env, "source")
+        installed = dist.install_distribution(str(staged), name="telem")
+        target = installed.target_dir
+        displaced = target.with_name("telem-displaced")
+        real_plan = dist.plan_install
+
+        def recreate_during_stage(*args, **kwargs):
+            plan = real_plan(*args, **kwargs)
+            target.rename(displaced)
+            target.mkdir()
+            write_manifest(
+                target,
+                DistributionManifest(
+                    name="telem",
+                    source=str(staged),
+                    version="replacement",
+                ),
+            )
+            (target / "sentinel.txt").write_text("new incarnation\n")
+            return plan
+
+        monkeypatch.setattr(dist, "plan_install", recreate_during_stage)
+
+        with pytest.raises(DistributionError, match="changed while update was staged"):
+            dist.update_distribution("telem")
+
+        assert (target / "sentinel.txt").read_text() == "new incarnation\n"
+        assert not (target / "SOUL.md").exists()
+
     def test_update_preserves_user_data(self, profile_env):
         # 1. Build staging dir, install
         staged = _make_staging_dir(profile_env, "src")
@@ -461,12 +591,23 @@ class TestDescribe:
 
 class TestSecurity:
 
-    def test_user_owned_exclude_covers_credentials(self):
+    def test_user_owned_exclude_covers_credentials_and_incarnation(self):
         assert "auth.json" in USER_OWNED_EXCLUDE
         assert ".env" in USER_OWNED_EXCLUDE
+        assert ".webui-profile-generation" in USER_OWNED_EXCLUDE
         assert "memories" in USER_OWNED_EXCLUDE
         assert "sessions" in USER_OWNED_EXCLUDE
         assert "local" in USER_OWNED_EXCLUDE
+
+    def test_install_does_not_import_profile_generation(self, profile_env):
+        staged = _make_staging_dir(profile_env, "src")
+        (staged / ".webui-profile-generation").write_text(
+            "11111111-1111-4111-8111-111111111111\n"
+        )
+
+        plan = install_distribution(str(staged), name="fresh")
+
+        assert not (plan.target_dir / ".webui-profile-generation").exists()
 
     def test_install_does_not_import_credentials_from_staging(self, profile_env):
         """If an author accidentally ships auth.json or .env in their

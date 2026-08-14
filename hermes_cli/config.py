@@ -690,7 +690,11 @@ def get_container_exec_info() -> Optional[dict]:
 # =============================================================================
 
 # Re-export from hermes_constants — canonical definition lives there.
-from hermes_constants import get_hermes_home, get_process_hermes_home  # noqa: F811,E402
+from hermes_constants import (  # noqa: F811,E402
+    get_hermes_home,
+    get_process_hermes_home,
+    profile_mutation_lock,
+)
 from utils import atomic_replace, fast_safe_load
 
 def get_config_path() -> Path:
@@ -861,13 +865,25 @@ def _ensure_default_soul_md(home: Path) -> None:
 
 
 # Home paths whose directory skeleton has been created this process — see
-# ensure_hermes_home(). Only successful passes are recorded, so a raised
-# managed-mode/missing-profile error keeps re-checking on later loads.
-_HERMES_HOME_ENSURED: set = set()
+# ensure_hermes_home().  Store the joint identity of the home directory and its
+# SOUL.md sentinel, not just the path: taking the Profile mutation lock can
+# recreate ``HERMES_HOME/.locks`` after the whole home was deleted, and filesystems
+# may immediately reuse the deleted directory's inode.  The lock bootstrap does
+# not recreate SOUL.md, so the joint identity reliably distinguishes that empty
+# replacement from the fully initialized tree.  Only successful passes are
+# recorded, so a raised managed-mode/missing-profile error keeps re-checking.
+_HERMES_HOME_ENSURED: Dict[str, Tuple[int, int, int, int]] = {}
 
 
 def ensure_hermes_home():
-    """Ensure ~/.hermes directory structure exists with secure permissions.
+    """Ensure the active Profile tree exists under its shared mutation lock."""
+    home = get_hermes_home()
+    with profile_mutation_lock(home):
+        _ensure_hermes_home_unlocked(home)
+
+
+def _ensure_hermes_home_unlocked(home: Path) -> None:
+    """Private bootstrap body; caller holds ``profile_mutation_lock(home)``.
 
     In managed mode (NixOS), dirs are created by the activation script with
     setgid + group-writable (2770). We skip mkdir and set umask(0o007) so
@@ -877,14 +893,25 @@ def ensure_hermes_home():
     config lock), and the ~14 mkdir/chmod syscalls per call made repeated
     config loads the dominant cost of hot read paths like ``model.options``.
     After the first successful pass for a given ``HERMES_HOME`` we only re-run
-    the full walk if the home directory itself has vanished (a deleted home is
-    recreated on the next load, as before). Profile switches change
+    the full walk if the home skeleton identity is no longer current.  This
+    catches a deleted-and-lock-recreated empty home even when the filesystem
+    immediately reuses its directory inode. Profile switches change
     ``get_hermes_home()`` and therefore re-run for the new path.
     """
-    home = get_hermes_home()
     key = str(home)
 
-    if key in _HERMES_HOME_ENSURED and home.is_dir():
+    try:
+        home_stat = home.stat()
+        soul_stat = (home / "SOUL.md").stat()
+        current_identity = (
+            int(home_stat.st_dev),
+            int(home_stat.st_ino),
+            int(soul_stat.st_dev),
+            int(soul_stat.st_ino),
+        )
+    except OSError:
+        current_identity = None
+    if _HERMES_HOME_ENSURED.get(key) == current_identity and current_identity is not None:
         return
     # Named profiles must be created explicitly (e.g. ``hermes profile create``).
     # If a stale process keeps running after the profile was renamed/deleted,
@@ -913,7 +940,14 @@ def ensure_hermes_home():
             _secure_dir(d)
         _ensure_default_soul_md(home)
 
-    _HERMES_HOME_ENSURED.add(key)
+    ensured_home_stat = home.stat()
+    ensured_soul_stat = (home / "SOUL.md").stat()
+    _HERMES_HOME_ENSURED[key] = (
+        int(ensured_home_stat.st_dev),
+        int(ensured_home_stat.st_ino),
+        int(ensured_soul_stat.st_dev),
+        int(ensured_soul_stat.st_ino),
+    )
 
 
 def _ensure_hermes_home_managed(home: Path):
@@ -3033,41 +3067,41 @@ def resolve_ephemeral_system_prompt_from_config(cfg: Optional[Dict[str, Any]]) -
 
 
 def read_raw_config() -> Dict[str, Any]:
-    """Read ~/.hermes/config.yaml as-is, without merging defaults or migrating.
+    """Read active Profile config under ``Profile -> config`` lock order.
 
-    Returns the raw YAML dict, or ``{}`` if the file doesn't exist or can't
-    be parsed.  Use this for lightweight config reads where you just need a
-    single value and don't want the overhead of ``load_config()``'s deep-merge
-    + migration pipeline.
-
-    Cached on the config file's (mtime_ns, size) — same strategy as
-    ``load_config()``. Returns a deepcopy on every call since some callers
-    mutate the result before passing to ``save_config()``.
+    Parse failures may persist a recovery copy, so this read-looking API is a
+    lifecycle writer and must participate in the shared Profile lock domain.
     """
-    with _CONFIG_LOCK:
-        try:
-            config_path = get_config_path()
-            st = config_path.stat()
-            cache_key = (st.st_mtime_ns, st.st_size)
-        except (FileNotFoundError, OSError):
-            return {}
+    home = get_hermes_home()
+    with profile_mutation_lock(home):
+        with _CONFIG_LOCK:
+            return _read_raw_config_locked(home / "config.yaml")
 
-        path_key = str(config_path)
-        cached = _RAW_CONFIG_CACHE.get(path_key)
-        if cached is not None and cached[:2] == cache_key:
-            return copy.deepcopy(cached[2])
 
-        try:
-            with open(config_path, encoding="utf-8") as f:
-                data = fast_safe_load(f) or {}
-        except Exception as e:
-            _warn_config_parse_failure(config_path, e)
-            return {}
+def _read_raw_config_locked(config_path: Path) -> Dict[str, Any]:
+    """Private raw-config reader; caller holds Profile and ``_CONFIG_LOCK``."""
+    try:
+        st = config_path.stat()
+        cache_key = (st.st_mtime_ns, st.st_size)
+    except (FileNotFoundError, OSError):
+        return {}
 
-        if not isinstance(data, dict):
-            data = {}
-        _RAW_CONFIG_CACHE[path_key] = (cache_key[0], cache_key[1], copy.deepcopy(data))
-        return data
+    path_key = str(config_path)
+    cached = _RAW_CONFIG_CACHE.get(path_key)
+    if cached is not None and cached[:2] == cache_key:
+        return copy.deepcopy(cached[2])
+
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            data = fast_safe_load(f) or {}
+    except Exception as e:
+        _warn_config_parse_failure(config_path, e)
+        return {}
+
+    if not isinstance(data, dict):
+        data = {}
+    _RAW_CONFIG_CACHE[path_key] = (cache_key[0], cache_key[1], copy.deepcopy(data))
+    return data
 
 
 def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
@@ -3189,25 +3223,19 @@ def require_readable_config_before_write(config_path: Optional[Path] = None) -> 
 
 
 def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
-    """Fail-closed atomic write for ``config.yaml``.
+    """Fail-closed config publication under the owning Profile lock.
 
-    The single chokepoint every config-update path should use instead of
-    calling :func:`utils.atomic_yaml_write` directly. It runs
-    :func:`require_readable_config_before_write` first, so a full-file
-    replacement can never silently clobber an existing ``config.yaml`` that
-    degraded to an empty dict on read (permission error, broken mount,
-    transient I/O). New-file creation still works when the path is absent.
-
-    Root cause this guards: ``read_raw_config()`` returns ``{}`` for BOTH an
-    absent file and an unreadable-but-present file. Callers that read then
-    overwrite can't tell the two apart, so an unreadable config would be
-    replaced with only defaults or the single edited section. Routing every
-    write through this helper enforces the invariant in one place rather than
-    relying on each of ~15 independent write sites to remember the guard.
-
-    ``kwargs`` are forwarded verbatim to ``atomic_yaml_write``
-    (``sort_keys``, ``default_flow_style``, ``extra_content``, ...).
+    ``config_path`` may name an explicitly scoped Profile, so its parent — not
+    the ambient active Profile — is the authoritative lock identity.
     """
+    config_path = Path(config_path)
+    with profile_mutation_lock(config_path.parent):
+        with _CONFIG_LOCK:
+            _atomic_config_write_locked(config_path, data, **kwargs)
+
+
+def _atomic_config_write_locked(config_path: Path, data: Any, **kwargs: Any) -> None:
+    """Private config publication; caller holds Profile and config locks."""
     from utils import atomic_yaml_write
 
     require_readable_config_before_write(config_path)
@@ -3407,9 +3435,19 @@ def apply_terminal_config_to_env(
 
 
 def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
+    """Load one immutable active-Profile snapshot under canonical lock order."""
+    home = get_hermes_home()
+    with profile_mutation_lock(home):
+        return _load_config_under_profile_lock(home, want_deepcopy=want_deepcopy)
+
+
+def _load_config_under_profile_lock(
+    home: Path, *, want_deepcopy: bool
+) -> Dict[str, Any]:
+    """Private load body; caller holds ``profile_mutation_lock(home)``."""
     with _CONFIG_LOCK:
-        ensure_hermes_home()
-        config_path = get_config_path()
+        _ensure_hermes_home_unlocked(home)
+        config_path = home / "config.yaml"
         path_key = str(config_path)
 
         try:
@@ -3635,6 +3673,26 @@ def save_config(
     preserve_keys: Optional[Set[Tuple[str, ...]]] = None,
     merge_existing: bool = False,
 ):
+    """Save active Profile config under ``Profile -> config`` lock order."""
+    home = get_hermes_home()
+    with profile_mutation_lock(home):
+        return _save_config_under_profile_lock(
+            home,
+            config,
+            strip_defaults=strip_defaults,
+            preserve_keys=preserve_keys,
+            merge_existing=merge_existing,
+        )
+
+
+def _save_config_under_profile_lock(
+    home: Path,
+    config: Dict[str, Any],
+    *,
+    strip_defaults: bool = True,
+    preserve_keys: Optional[Set[Tuple[str, ...]]] = None,
+    merge_existing: bool = False,
+):
     """Save configuration to ~/.hermes/config.yaml.\n
 
     Default values from ``DEFAULT_CONFIG`` are not written to disk unless
@@ -3671,14 +3729,14 @@ def save_config(
                 )
         from utils import atomic_yaml_write
 
-        ensure_hermes_home()
-        config_path = get_config_path()
+        _ensure_hermes_home_unlocked(home)
+        config_path = home / "config.yaml"
         require_readable_config_before_write(config_path)
         # Compute explicit user paths BEFORE any normalisation --------
         # _normalize_max_turns_config may inject agent.max_turns from
         # DEFAULT_CONFIG; using the raw dict preserves which paths the
         # user actually set so _strip_default_values can keep them.
-        _raw_for_paths = read_raw_config()
+        _raw_for_paths = _read_raw_config_locked(config_path)
         explicit_raw_paths: Optional[Set[Tuple[str, ...]]] = (
             _explicit_config_paths(_raw_for_paths) if _raw_for_paths else None
         )
@@ -3869,12 +3927,16 @@ def _sanitize_env_lines(lines: list) -> list:
 
 
 def sanitize_env_file() -> int:
-    """Read, sanitize, and rewrite ~/.hermes/.env in place.
+    """Sanitize the active Profile's ``.env`` under its mutation lock."""
+    home = get_hermes_home()
+    with profile_mutation_lock(home):
+        return _sanitize_env_file_unlocked(home)
 
-    Returns the number of lines whose safe formatting was normalized. Returns
-    0 when no changes are needed.
-    """
-    env_path = get_env_path()
+
+
+def _sanitize_env_file_unlocked(home: Path) -> int:
+    """Private env sanitizer; caller holds ``profile_mutation_lock(home)``."""
+    env_path = home / ".env"
     if not env_path.exists():
         return 0
 
@@ -3989,7 +4051,14 @@ def _env_line_defines_key(line: str, key: str) -> bool:
 
 
 def save_env_value(key: str, value: str):
-    """Save or update a value in ~/.hermes/.env."""
+    """Save one active-Profile env value under its mutation lock."""
+    home = get_hermes_home()
+    with profile_mutation_lock(home):
+        return _save_env_value_unlocked(home, key, value)
+
+
+def _save_env_value_unlocked(home: Path, key: str, value: str):
+    """Private env RMW; caller holds ``profile_mutation_lock(home)``."""
     if is_managed():
         managed_error(f"set {key}")
         return
@@ -4012,8 +4081,8 @@ def save_env_value(key: str, value: str):
     value = value.replace("\n", "").replace("\r", "")
     # API keys / tokens must be ASCII — strip non-ASCII with a warning.
     value = _check_non_ascii_credential(key, value)
-    ensure_hermes_home()
-    env_path = get_env_path()
+    _ensure_hermes_home_unlocked(home)
+    env_path = home / ".env"
 
     # On Windows, open() defaults to the system locale (cp1252) which can
     # cause OSError errno 22 on UTF-8 .env files.
@@ -4102,10 +4171,14 @@ def custom_endpoint_key_env(identity: str) -> str:
 
 
 def remove_env_value(key: str) -> bool:
-    """Remove a key from ~/.hermes/.env and os.environ.
+    """Remove one active-Profile env value under its mutation lock."""
+    home = get_hermes_home()
+    with profile_mutation_lock(home):
+        return _remove_env_value_unlocked(home, key)
 
-    Returns True if the key was found and removed, False otherwise.
-    """
+
+def _remove_env_value_unlocked(home: Path, key: str) -> bool:
+    """Private env RMW; caller holds ``profile_mutation_lock(home)``."""
     if is_managed():
         managed_error(f"remove {key}")
         return False
@@ -4123,7 +4196,7 @@ def remove_env_value(key: str) -> bool:
         return False
     if not _ENV_VAR_NAME_RE.match(key):
         raise ValueError(f"Invalid environment variable name: {key!r}")
-    env_path = get_env_path()
+    env_path = home / ".env"
     if not env_path.exists():
         os.environ.pop(key, None)
         return False
@@ -5116,6 +5189,15 @@ def set_config_value(key: str, value: str, force: bool = False):
             refused (bare ``model`` is redirected to ``model.default``). The
             CLI exposes this via ``hermes config set --force``.
     """
+    home = get_hermes_home()
+    with profile_mutation_lock(home):
+        return _set_config_value_unlocked(home, key, value, force=force)
+
+
+def _set_config_value_unlocked(
+    home: Path, key: str, value: str, force: bool = False
+):
+    """Private config/.env RMW; caller holds ``profile_mutation_lock(home)``."""
     if is_managed():
         managed_error("set configuration values")
         return
@@ -5157,7 +5239,7 @@ def set_config_value(key: str, value: str, force: bool = False):
     # Otherwise it goes to config.yaml
     # Read the raw user config (not merged with defaults) to avoid
     # dumping all default values back to the file
-    config_path = get_config_path()
+    config_path = home / "config.yaml"
     require_readable_config_before_write(config_path)
     user_config = {}
     if config_path.exists():
@@ -5272,15 +5354,15 @@ def set_config_value(key: str, value: str, force: bool = False):
         key = "model.base_url"
         print("  (note: 'api_base' is an alias — saved as model.base_url)")
     # Write only user config back (not the full merged defaults)
-    ensure_hermes_home()
-    from utils import atomic_yaml_write
-    atomic_yaml_write(config_path, user_config, sort_keys=False)
+    _ensure_hermes_home_unlocked(home)
+    with _CONFIG_LOCK:
+        _atomic_config_write_locked(config_path, user_config, sort_keys=False)
     
     # Keep .env in sync for keys that terminal_tool reads directly from env vars.
     # config.yaml is authoritative, but terminal_tool only reads TERMINAL_ENV etc.
     env_var = terminal_config_env_var_for_key(key)
     if env_var and key != "terminal.cwd":
-        save_env_value(env_var, _terminal_env_value(value))
+        _save_env_value_unlocked(home, env_var, _terminal_env_value(value))
 
     # Setting display.skin is an explicit "apply NOW" — bump the skin file's
     # mtime so the gateway watcher's (name, mtime) signature moves even when the

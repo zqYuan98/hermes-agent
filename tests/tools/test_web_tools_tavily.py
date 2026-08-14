@@ -171,7 +171,7 @@ class TestWebExtractTavily:
         from agent.web_search_registry import _reset_for_tests
         _reset_for_tests()
 
-    def test_extract_dispatches_to_tavily(self):
+    def test_extract_dispatches_to_tavily(self, stable_public_dns):
         mock_response = MagicMock()
         mock_response.json.return_value = {
             "results": [{"url": "https://example.com", "raw_content": "Extracted content", "title": "Page"}]

@@ -24,8 +24,9 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path, PurePosixPath
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, profile_mutation_lock
 from hermes_cli._subprocess_compat import windows_hide_flags
 from agent.skill_utils import is_excluded_skill_path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -39,6 +40,7 @@ from tools.skills_guard import (
 )
 from tools.url_safety import is_safe_url
 from tools.website_policy import check_website_access
+from utils import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +99,16 @@ def _taps_file() -> Path:
 def _index_cache_dir() -> Path:
     forced = _override("INDEX_CACHE_DIR")
     return Path(forced) if forced is not None else _hub_dir() / "index-cache"
+
+
+def _profile_mutation_entry(func):
+    """Run a Hub filesystem mutation under the active Profile's shared lock."""
+    @wraps(func)
+    def _locked(*args, **kwargs):
+        with profile_mutation_lock(_skills_dir().parent):
+            return func(*args, **kwargs)
+
+    return _locked
 
 
 _DYNAMIC_PATH_RESOLVERS = {
@@ -1156,6 +1168,7 @@ class GitHubSource(SkillSource):
         except (OSError, json.JSONDecodeError):
             return None
 
+    @_profile_mutation_entry
     def _write_cache(self, key: str, data: list) -> None:
         """Write index data to cache."""
         index_cache_dir = _index_cache_dir()
@@ -3636,6 +3649,7 @@ def _read_index_cache(key: str) -> Optional[Any]:
         return None
 
 
+@_profile_mutation_entry
 def _write_index_cache(key: str, data: Any) -> None:
     """Write data to cache."""
     index_cache_dir = _index_cache_dir()
@@ -3689,10 +3703,15 @@ class HubLockFile:
         except (json.JSONDecodeError, OSError):
             return {"version": 1, "installed": {}}
 
+    @_profile_mutation_entry
     def save(self, data: dict) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        """Atomically replace lock.json while holding the owning Profile lock."""
+        atomic_write_text(
+            self.path,
+            json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+        )
 
+    @_profile_mutation_entry
     def record_install(
         self,
         name: str,
@@ -3728,6 +3747,7 @@ class HubLockFile:
         }
         self.save(data)
 
+    @_profile_mutation_entry
     def record_uninstall(self, name: str) -> None:
         data = self.load()
         data["installed"].pop(name, None)
@@ -3764,10 +3784,12 @@ class TapsManager:
         except (json.JSONDecodeError, OSError):
             return []
 
+    @_profile_mutation_entry
     def save(self, taps: List[dict]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps({"taps": taps}, indent=2) + "\n", encoding="utf-8")
 
+    @_profile_mutation_entry
     def add(self, repo: str, path: str = "skills/") -> bool:
         """Add a tap. Returns False if already exists."""
         taps = self.load()
@@ -3777,6 +3799,7 @@ class TapsManager:
         self.save(taps)
         return True
 
+    @_profile_mutation_entry
     def remove(self, repo: str) -> bool:
         """Remove a tap by repo name. Returns False if not found."""
         taps = self.load()
@@ -3794,6 +3817,7 @@ class TapsManager:
 # Audit log
 # ---------------------------------------------------------------------------
 
+@_profile_mutation_entry
 def append_audit_log(action: str, skill_name: str, source: str,
                      trust_level: str, verdict: str, extra: str = "") -> None:
     """Append a line to the audit log."""
@@ -3815,6 +3839,7 @@ def append_audit_log(action: str, skill_name: str, source: str,
 # Hub operations (high-level)
 # ---------------------------------------------------------------------------
 
+@_profile_mutation_entry
 def ensure_hub_dirs() -> None:
     """Create the .hub directory structure if it doesn't exist."""
     hub_dir = _hub_dir()
@@ -3832,6 +3857,7 @@ def ensure_hub_dirs() -> None:
         taps_file.write_text('{"taps": []}\n', encoding="utf-8")
 
 
+@_profile_mutation_entry
 def quarantine_bundle(bundle: SkillBundle) -> Path:
     """Write a skill bundle to the quarantine directory for scanning."""
     ensure_hub_dirs()
@@ -3883,6 +3909,7 @@ def _category_skill_dirs(directory: Path) -> List[str]:
     return skill_dirs
 
 
+@_profile_mutation_entry
 def install_from_quarantine(
     quarantine_path: Path,
     skill_name: str,
@@ -4024,6 +4051,7 @@ def install_from_quarantine(
     return install_dir
 
 
+@_profile_mutation_entry
 def uninstall_skill(skill_name: str) -> Tuple[bool, str]:
     """Remove a hub-installed skill. Refuses to remove builtins."""
     lock = HubLockFile()
@@ -4174,6 +4202,17 @@ def _hermes_index_cache_file() -> Path:
     return _index_cache_dir() / "hermes-index.json"
 
 
+@_profile_mutation_entry
+def _write_hermes_index_cache(data: dict) -> None:
+    """Persist the centralized index without holding the Profile lock on I/O fetch."""
+    hermes_index_cache_file = _hermes_index_cache_file()
+    try:
+        hermes_index_cache_file.parent.mkdir(parents=True, exist_ok=True)
+        hermes_index_cache_file.write_text(json.dumps(data), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _load_hermes_index() -> Optional[dict]:
     """Fetch the centralized skills index, with local cache.
 
@@ -4238,12 +4277,9 @@ def _load_hermes_index() -> Optional[dict]:
     if not isinstance(data, dict) or "skills" not in data:
         return _load_stale_index_cache()
 
-    # Cache locally
-    try:
-        hermes_index_cache_file.parent.mkdir(parents=True, exist_ok=True)
-        hermes_index_cache_file.write_text(json.dumps(data), encoding="utf-8")
-    except OSError:
-        pass
+    # Cache locally after the network operation; the helper takes the shared
+    # Profile lock only for the filesystem mutation itself.
+    _write_hermes_index_cache(data)
 
     return data
 

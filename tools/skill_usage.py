@@ -30,10 +30,11 @@ import os
 import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, profile_mutation_lock
 from agent.skill_utils import is_excluded_skill_path, is_external_skill_path
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,16 @@ def is_protected_builtin(skill_name: str) -> bool:
 
 def _skills_dir() -> Path:
     return get_hermes_home() / "skills"
+
+
+def _profile_mutation_entry(func):
+    """Take the Profile-wide lock before any module-local metadata lock."""
+    @wraps(func)
+    def _locked(*args, **kwargs):
+        with profile_mutation_lock(_skills_dir().parent):
+            return func(*args, **kwargs)
+
+    return _locked
 
 
 def _usage_file() -> Path:
@@ -293,6 +304,7 @@ def read_suppressed_names() -> Set[str]:
     return names
 
 
+@_profile_mutation_entry
 def _write_suppressed_names(names: Set[str]) -> None:
     path = _suppressed_file()
     try:
@@ -315,6 +327,7 @@ def _write_suppressed_names(names: Set[str]) -> None:
         logger.debug("Failed to write curator suppression list: %s", e, exc_info=True)
 
 
+@_profile_mutation_entry
 def add_suppressed_name(skill_name: str) -> None:
     """Record that a built-in skill was pruned, so sync won't restore it."""
     if not skill_name:
@@ -325,6 +338,7 @@ def add_suppressed_name(skill_name: str) -> None:
         _write_suppressed_names(names)
 
 
+@_profile_mutation_entry
 def remove_suppressed_name(skill_name: str) -> None:
     """Clear a built-in's suppression entry (e.g. on restore)."""
     if not skill_name:
@@ -679,6 +693,7 @@ def load_usage() -> Dict[str, Dict[str, Any]]:
     return clean
 
 
+@_profile_mutation_entry
 def save_usage(data: Dict[str, Dict[str, Any]]) -> bool:
     """Write the usage map atomically and report whether it committed."""
     path = _usage_file()
@@ -718,6 +733,7 @@ def get_record(skill_name: str) -> Dict[str, Any]:
     return rec
 
 
+@_profile_mutation_entry
 def seed_record_if_missing(skill_name: str) -> None:
     """Persist a baseline usage record for a curation-eligible skill.
 
@@ -740,6 +756,7 @@ def seed_record_if_missing(skill_name: str) -> None:
         logger.debug("skill_usage.seed_record_if_missing(%s) failed: %s", skill_name, e, exc_info=True)
 
 
+@_profile_mutation_entry
 def _mutate(skill_name: str, mutator, *, require_curation_eligible: bool = False) -> Any:
     """Load, apply *mutator(record)* in place, save. Best-effort.
 
@@ -1050,6 +1067,7 @@ def is_sync_enabled(skill_name: str) -> bool:
     return get_record(skill_name).get("sync") is True
 
 
+@_profile_mutation_entry
 def forget(skill_name: str) -> None:
     """Drop a skill's usage entry entirely. Called when the skill is deleted."""
     if not skill_name:
@@ -1068,6 +1086,7 @@ def forget(skill_name: str) -> None:
 # Archive / restore
 # ---------------------------------------------------------------------------
 
+@_profile_mutation_entry
 def archive_skill(skill_name: str) -> Tuple[bool, str]:
     """Move a curator-eligible skill directory to ~/.hermes/skills/.archive/.
 
@@ -1129,6 +1148,7 @@ def archive_skill(skill_name: str) -> Tuple[bool, str]:
     return True, f"archived to {dest}"
 
 
+@_profile_mutation_entry
 def restore_skill(skill_name: str) -> Tuple[bool, str]:
     """Move an archived skill back to ~/.hermes/skills/. Restores to the flat
     top-level layout; original category nesting is NOT reconstructed.

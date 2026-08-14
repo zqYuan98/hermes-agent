@@ -29,6 +29,7 @@ import os
 import shutil
 import sys
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path, PurePosixPath
 
 # Force stdout/stderr to UTF-8. On non-UTF-8 Windows locales (e.g. CP936/GBK
@@ -45,7 +46,15 @@ for _stream in (sys.stdout, sys.stderr):
             _stream.reconfigure(encoding="utf-8", errors="replace")
         except (ValueError, TypeError):
             pass
-from hermes_constants import get_bundled_skills_dir, get_hermes_home, get_optional_skills_dir
+from hermes_constants import (
+    get_bundled_skills_dir,
+    get_hermes_home,
+    get_hermes_home_override,
+    get_optional_skills_dir,
+    profile_mutation_lock,
+    reset_hermes_home_override,
+    set_hermes_home_override,
+)
 from agent.skill_utils import is_excluded_skill_path
 from typing import Dict, List, Optional, Set, Tuple
 from utils import atomic_replace
@@ -65,6 +74,47 @@ MANIFEST_FILE = SKILLS_DIR / ".bundled_manifest"
 # hermes_cli.profiles.NO_BUNDLED_SKILLS_MARKER (kept as a literal here to
 # avoid importing the CLI layer into this low-level sync module).
 NO_BUNDLED_SKILLS_MARKER = ".no-bundled-skills"
+
+
+def _scoped_profile_home() -> Path:
+    """Return the explicit task-local Profile, or the legacy cached default."""
+    override = get_hermes_home_override()
+    return Path(override) if override else HERMES_HOME
+
+
+def _scoped_skills_dir() -> Path:
+    """Return this execution context's Skills tree.
+
+    Keeping the legacy module constant as the default preserves test/plugin
+    patches, while an explicit Profile scope remains task-local via ContextVar.
+    """
+    override = get_hermes_home_override()
+    return Path(override) / "skills" if override else SKILLS_DIR
+
+
+def _scoped_manifest_file() -> Path:
+    override = get_hermes_home_override()
+    return Path(override) / "skills" / ".bundled_manifest" if override else MANIFEST_FILE
+
+
+def _profile_mutation_entry(func):
+    """Run one Skills-tree mutation under the owning Profile lock."""
+    @wraps(func)
+    def _locked(*args, **kwargs):
+        with profile_mutation_lock(_scoped_skills_dir().parent):
+            return func(*args, **kwargs)
+
+    return _locked
+
+
+def _profile_home_mutation_entry(func):
+    """Run one Profile-root marker mutation under the owning Profile lock."""
+    @wraps(func)
+    def _locked(*args, **kwargs):
+        with profile_mutation_lock(_scoped_profile_home()):
+            return func(*args, **kwargs)
+
+    return _locked
 
 
 def _get_bundled_dir() -> Path:
@@ -117,11 +167,12 @@ def _read_manifest() -> Dict[str, str]:
     Handles both v1 (plain names) and v2 (name:hash) formats.
     v1 entries get an empty hash string which triggers migration on next sync.
     """
-    if not MANIFEST_FILE.exists():
+    manifest_file = _scoped_manifest_file()
+    if not manifest_file.exists():
         return {}
     try:
         result = {}
-        for line in MANIFEST_FILE.read_text(encoding="utf-8").splitlines():
+        for line in manifest_file.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -149,7 +200,7 @@ def _read_suppressed_names() -> set:
 
         return read_suppressed_names()
     except Exception:
-        path = SKILLS_DIR / ".curator_suppressed"
+        path = _scoped_skills_dir() / ".curator_suppressed"
         if not path.exists():
             return set()
         names = set()
@@ -163,6 +214,7 @@ def _read_suppressed_names() -> set:
         return names
 
 
+@_profile_mutation_entry
 def _write_manifest(entries: Dict[str, str]):
     """Write the manifest file atomically in v2 format (name:hash).
 
@@ -171,12 +223,13 @@ def _write_manifest(entries: Dict[str, str]):
     """
     import tempfile
 
-    MANIFEST_FILE.parent.mkdir(parents=True, exist_ok=True)
+    manifest_file = _scoped_manifest_file()
+    manifest_file.parent.mkdir(parents=True, exist_ok=True)
     data = "\n".join(f"{name}:{hash_val}" for name, hash_val in sorted(entries.items())) + "\n"
 
     try:
         fd, tmp_path = tempfile.mkstemp(
-            dir=str(MANIFEST_FILE.parent),
+            dir=str(manifest_file.parent),
             prefix=".bundled_manifest_",
             suffix=".tmp",
         )
@@ -185,7 +238,7 @@ def _write_manifest(entries: Dict[str, str]):
                 f.write(data)
                 f.flush()
                 os.fsync(f.fileno())
-            atomic_replace(tmp_path, MANIFEST_FILE)
+            atomic_replace(tmp_path, manifest_file)
         except BaseException:
             try:
                 os.unlink(tmp_path)
@@ -193,7 +246,7 @@ def _write_manifest(entries: Dict[str, str]):
                 pass
             raise
     except Exception as e:
-        logger.debug("Failed to write skills manifest %s: %s", MANIFEST_FILE, e, exc_info=True)
+        logger.debug("Failed to write skills manifest %s: %s", manifest_file, e, exc_info=True)
 
 
 def _read_skill_name(skill_md: Path, fallback: str) -> str:
@@ -248,7 +301,7 @@ def _compute_relative_dest(skill_dir: Path, bundled_dir: Path) -> Path:
     e.g., bundled/skills/mlops/axolotl -> ~/.hermes/skills/mlops/axolotl
     """
     rel = skill_dir.relative_to(bundled_dir)
-    return SKILLS_DIR / rel
+    return _scoped_skills_dir() / rel
 
 
 def _dir_hash(directory: Path) -> str:
@@ -326,9 +379,10 @@ def _optional_skill_index() -> Dict[str, Tuple[str, str, Path]]:
     return index
 
 
+@_profile_mutation_entry
 def _move_to_restore_backup(path: Path, backup_root: Path) -> str:
     """Move an existing skill directory into a restore backup, preserving rel path."""
-    rel = path.relative_to(SKILLS_DIR)
+    rel = path.relative_to(_scoped_skills_dir())
     target = backup_root / rel
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
@@ -340,6 +394,7 @@ def _move_to_restore_backup(path: Path, backup_root: Path) -> str:
     return rel.as_posix()
 
 
+@_profile_mutation_entry
 def restore_official_optional_skill(name: str, *, restore: bool = False) -> dict:
     """Restore one or all official optional skills from repo source.
 
@@ -360,11 +415,12 @@ def restore_official_optional_skill(name: str, *, restore: bool = False) -> dict
 
     restored: List[str] = []
     backed_up: List[str] = []
+    skills_dir = _scoped_skills_dir()
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    backup_root = SKILLS_DIR / ".restore-backups" / f"official-optional-{timestamp}"
+    backup_root = skills_dir / ".restore-backups" / f"official-optional-{timestamp}"
 
     for folder_name, install_path, src in targets:
-        dest = SKILLS_DIR / Path(*install_path.split("/"))
+        dest = skills_dir / Path(*install_path.split("/"))
         src_hash = _dir_hash(src)
         canonical_ok = dest.exists() and _dir_hash(dest) == src_hash
 
@@ -372,13 +428,13 @@ def restore_official_optional_skill(name: str, *, restore: bool = False) -> dict
         # or folder slug, even if curator moved it into another category.
         src_frontmatter = _read_skill_name(src / "SKILL.md", folder_name)
         matches: List[Path] = []
-        if SKILLS_DIR.exists():
-            for skill_md in sorted(SKILLS_DIR.rglob("SKILL.md")):
+        if skills_dir.exists():
+            for skill_md in sorted(skills_dir.rglob("SKILL.md")):
                 if is_excluded_skill_path(skill_md):
                     continue
                 candidate = skill_md.parent
                 try:
-                    candidate.relative_to(SKILLS_DIR)
+                    candidate.relative_to(skills_dir)
                 except ValueError:
                     continue
                 candidate_name = _read_skill_name(skill_md, candidate.name)
@@ -414,15 +470,16 @@ def restore_official_optional_skill(name: str, *, restore: bool = False) -> dict
 def _index_installed_skill_dirs_by_name() -> Dict[str, List[Path]]:
     """Index installed skills by directory name with one active-tree scan."""
     index: Dict[str, List[Path]] = {}
-    if not SKILLS_DIR.exists():
+    skills_dir = _scoped_skills_dir()
+    if not skills_dir.exists():
         return index
-    for skill_md in SKILLS_DIR.rglob("SKILL.md"):
+    for skill_md in skills_dir.rglob("SKILL.md"):
         if is_excluded_skill_path(skill_md):
             continue
         candidate = skill_md.parent
         # Never reach outside the skills tree (symlinked/external dirs).
         try:
-            candidate.resolve().relative_to(SKILLS_DIR.resolve())
+            candidate.resolve().relative_to(skills_dir.resolve())
         except (OSError, ValueError):
             continue
         index.setdefault(candidate.name, []).append(candidate)
@@ -442,7 +499,8 @@ def _find_installed_skill_dir_by_name(
     would write provenance onto the wrong skill. The caller still verifies a
     byte-identical content hash before recording anything.
     """
-    if not skill_dir_name or not SKILLS_DIR.exists():
+    skills_dir = _scoped_skills_dir()
+    if not skill_dir_name or not skills_dir.exists():
         return None
     if installed_index is None:
         installed_index = _index_installed_skill_dirs_by_name()
@@ -452,6 +510,7 @@ def _find_installed_skill_dir_by_name(
     return matches[0]
 
 
+@_profile_mutation_entry
 def _backfill_optional_provenance(quiet: bool = False) -> List[str]:
     """Mark already-present official optional skills as hub-installed.
 
@@ -465,7 +524,8 @@ def _backfill_optional_provenance(quiet: bool = False) -> List[str]:
     if not optional_dir.exists():
         return []
 
-    lock_path = SKILLS_DIR / ".hub" / "lock.json"
+    skills_dir = _scoped_skills_dir()
+    lock_path = skills_dir / ".hub" / "lock.json"
     try:
         data = json.loads(lock_path.read_text(encoding="utf-8")) if lock_path.exists() else {"version": 1, "installed": {}}
     except (json.JSONDecodeError, OSError):
@@ -492,7 +552,7 @@ def _backfill_optional_provenance(quiet: bool = False) -> List[str]:
         lock_name = src.name
         if lock_name in installed or install_path in existing_paths:
             continue
-        dest = SKILLS_DIR / Path(*install_path.split("/"))
+        dest = skills_dir / Path(*install_path.split("/"))
         if not dest.exists() or not dest.is_dir():
             # The active tree may hold the same skill under a DIFFERENT
             # category path than the repo uses — categories get reorganized
@@ -508,7 +568,7 @@ def _backfill_optional_provenance(quiet: bool = False) -> List[str]:
             if dest is None:
                 continue
             try:
-                install_path = _safe_rel_install_path(dest, SKILLS_DIR)
+                install_path = _safe_rel_install_path(dest, skills_dir)
             except ValueError as e:
                 logger.debug("Skipping relocated optional skill %s: %s", dest, e)
                 continue
@@ -572,7 +632,7 @@ def _read_hub_install_paths() -> Set[str]:
     content happens to match a bundled origin hash, or the lock's
     ``install_path`` would point at a directory that no longer exists.
     """
-    lock_path = SKILLS_DIR / ".hub" / "lock.json"
+    lock_path = _scoped_skills_dir() / ".hub" / "lock.json"
     if not lock_path.exists():
         return set()
     try:
@@ -595,9 +655,10 @@ def _index_active_skills() -> Dict[str, List[Path]]:
     locate a bundled skill that upstream moved to a new category/directory.
     """
     index: Dict[str, List[Path]] = {}
-    if not SKILLS_DIR.exists():
+    skills_dir = _scoped_skills_dir()
+    if not skills_dir.exists():
         return index
-    for skill_md in SKILLS_DIR.rglob("SKILL.md"):
+    for skill_md in skills_dir.rglob("SKILL.md"):
         if is_excluded_skill_path(skill_md):
             continue
         skill_dir = skill_md.parent
@@ -633,11 +694,12 @@ def _recover_renamed_skill(
     if not origin_hash:
         return None
 
+    skills_dir = _scoped_skills_dir()
     for candidate in active_index.get(skill_name, []):
         if candidate == dest or not candidate.is_dir():
             continue
         try:
-            rel = candidate.relative_to(SKILLS_DIR).as_posix()
+            rel = candidate.relative_to(skills_dir).as_posix()
         except ValueError:
             continue
         # Never relocate a hub-installed skill — the hub owns its path.
@@ -650,7 +712,7 @@ def _recover_renamed_skill(
             if not quiet:
                 print(
                     f"  ⚠ {skill_name}: upstream moved this skill to "
-                    f"{dest.relative_to(SKILLS_DIR).as_posix()}, but your "
+                    f"{dest.relative_to(skills_dir).as_posix()}, but your "
                     f"modified copy at {rel} was kept — it will not receive "
                     f"updates. Run `hermes skills reset {skill_name} --restore` "
                     f"to move to the new location."
@@ -667,11 +729,12 @@ def _recover_renamed_skill(
             return None
         logger.info("Relocated renamed bundled skill: %s -> %s", candidate, dest)
         if not quiet:
-            print(f"  → {skill_name} (moved {rel} → {dest.relative_to(SKILLS_DIR).as_posix()})")
+            print(f"  → {skill_name} (moved {rel} → {dest.relative_to(skills_dir).as_posix()})")
         return rel
     return None
 
 
+@_profile_mutation_entry
 def sync_skills(quiet: bool = False) -> dict:
     """
     Sync bundled skills into ~/.hermes/skills/ using the manifest.
@@ -685,7 +748,9 @@ def sync_skills(quiet: bool = False) -> dict:
     # empty-result shape with skipped_opt_out lets callers report "opted out"
     # instead of "synced 0 / failed". This is the default-profile counterpart
     # to seed_profile_skills()'s marker check for named profiles.
-    if (HERMES_HOME / NO_BUNDLED_SKILLS_MARKER).exists():
+    profile_home = _scoped_profile_home()
+    skills_dir = _scoped_skills_dir()
+    if (profile_home / NO_BUNDLED_SKILLS_MARKER).exists():
         if not quiet:
             print("  (skipped — profile opted out of bundled skills via .no-bundled-skills)")
         return {
@@ -702,7 +767,7 @@ def sync_skills(quiet: bool = False) -> dict:
             "optional_provenance_backfilled": [],
         }
 
-    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+    skills_dir.mkdir(parents=True, exist_ok=True)
     manifest = _read_manifest()
     bundled_skills = _discover_bundled_skills(bundled_dir)
     bundled_names = {name for name, _ in bundled_skills}
@@ -923,7 +988,7 @@ def sync_skills(quiet: bool = False) -> dict:
     # Also copy DESCRIPTION.md files for categories (if not already present)
     for desc_md in bundled_dir.rglob("DESCRIPTION.md"):
         rel = desc_md.relative_to(bundled_dir)
-        dest_desc = SKILLS_DIR / rel
+        dest_desc = skills_dir / rel
         if not dest_desc.exists():
             try:
                 dest_desc.parent.mkdir(parents=True, exist_ok=True)
@@ -948,6 +1013,23 @@ def sync_skills(quiet: bool = False) -> dict:
     }
 
 
+def sync_skills_for_profile(profile_home: Path, quiet: bool = False) -> dict:
+    """Synchronize bundled skills for one explicit Profile in this process.
+
+    The task-local override keeps dynamic collaborators, Hub provenance, and
+    shared lock identity on the same Profile. Re-entry from a lifecycle
+    transaction is safe because the mutation lock is same-thread reentrant.
+    """
+    home = Path(profile_home).expanduser().resolve()
+    with profile_mutation_lock(home):
+        token = set_hermes_home_override(home)
+        try:
+            return sync_skills(quiet=quiet)
+        finally:
+            reset_hermes_home_override(token)
+
+
+@_profile_mutation_entry
 def _rmtree_writable(path: Path) -> None:
     """Remove a directory tree, making read-only entries writable first.
 
@@ -969,7 +1051,7 @@ def _rmtree_writable(path: Path) -> None:
     # ``shutil.rmtree(~/.hermes)`` into a loud, recoverable ``ValueError``
     # instead of silently destroying the user's install.
     target = Path(path).resolve()
-    skills_root = SKILLS_DIR.resolve()
+    skills_root = _scoped_skills_dir().resolve()
     # Every legitimate caller passes a skill directory or its ``.bak``
     # sibling — always a strict child of the skills root. The skills root
     # itself must never be removed: a ``dest`` that collapses to
@@ -997,6 +1079,7 @@ def _rmtree_writable(path: Path) -> None:
     shutil.rmtree(path, onerror=_on_error)
 
 
+@_profile_mutation_entry
 def reset_bundled_skill(name: str, restore: bool = False) -> dict:
     """
     Reset a bundled skill's manifest tracking so future syncs work normally.
@@ -1263,6 +1346,7 @@ def diff_bundled_skill(name: str) -> dict:
     }
 
 
+@_profile_home_mutation_entry
 def set_bundled_skills_opt_out(enabled: bool) -> dict:
     """Toggle the .no-bundled-skills opt-out marker for the active profile.
 
@@ -1277,11 +1361,12 @@ def set_bundled_skills_opt_out(enabled: bool) -> dict:
         dict with keys: ok (bool), changed (bool), marker (str path),
                         message (str).
     """
-    marker = HERMES_HOME / NO_BUNDLED_SKILLS_MARKER
+    profile_home = _scoped_profile_home()
+    marker = profile_home / NO_BUNDLED_SKILLS_MARKER
     existed = marker.exists()
     try:
         if enabled:
-            HERMES_HOME.mkdir(parents=True, exist_ok=True)
+            profile_home.mkdir(parents=True, exist_ok=True)
             marker.write_text(
                 "This profile opted out of bundled-skill seeding "
                 "(`hermes skills opt-out`).\n"
@@ -1315,9 +1400,10 @@ def set_bundled_skills_opt_out(enabled: bool) -> dict:
 
 def is_bundled_skills_opt_out() -> bool:
     """Return True if the active profile carries the opt-out marker."""
-    return (HERMES_HOME / NO_BUNDLED_SKILLS_MARKER).exists()
+    return (_scoped_profile_home() / NO_BUNDLED_SKILLS_MARKER).exists()
 
 
+@_profile_mutation_entry
 def remove_pristine_bundled_skills(dry_run: bool = False) -> dict:
     """Delete bundled skills that are present, manifest-tracked, AND unmodified.
 

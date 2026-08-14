@@ -385,6 +385,7 @@ class TestSlackAttachmentDiagnostics:
 # SlackAdapter._download_slack_file
 # ---------------------------------------------------------------------------
 
+@pytest.mark.usefixtures("stable_public_dns")
 class TestSlackDownloadSlackFile:
     """Tests for SlackAdapter._download_slack_file"""
 
@@ -447,6 +448,7 @@ class TestSlackDownloadSlackFile:
 # SlackAdapter._download_slack_file_bytes
 # ---------------------------------------------------------------------------
 
+@pytest.mark.usefixtures("stable_public_dns")
 class TestSlackDownloadSlackFileBytes:
     """Tests for SlackAdapter._download_slack_file_bytes"""
 

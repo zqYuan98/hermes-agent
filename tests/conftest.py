@@ -23,12 +23,46 @@ import asyncio
 import atexit
 import os
 import shutil
+import socket
 import sqlite3
 import sys
 import tempfile
 from pathlib import Path
 
 import pytest
+
+
+@pytest.fixture
+def stable_public_dns(monkeypatch):
+    """Resolve mocked public HTTP targets without consulting ambient DNS.
+
+    Transparent proxies and VPNs may map public domains into the RFC 2544
+    benchmarking range (198.18.0.0/15). Hermes correctly rejects those
+    answers as non-public, so tests whose HTTP transport is already mocked
+    must provide a deterministic public answer instead.
+    """
+    real_getaddrinfo = socket.getaddrinfo
+    public_hosts = {"example.com", "files.slack.com", "github.com"}
+
+    def fake_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        normalized = (
+            host.decode("ascii", errors="ignore")
+            if isinstance(host, bytes)
+            else str(host)
+        ).lower().rstrip(".")
+        if normalized in public_hosts:
+            return [
+                (
+                    socket.AF_INET,
+                    type or socket.SOCK_STREAM,
+                    proto or socket.IPPROTO_TCP,
+                    "",
+                    ("93.184.216.34", port or 0),
+                )
+            ]
+        return real_getaddrinfo(host, port, family, type, proto, flags)
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
 
 # Ensure project root is importable
 PROJECT_ROOT = Path(__file__).parent.parent
