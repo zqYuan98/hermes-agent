@@ -1,5 +1,5 @@
 """Tests for the AGENTS.md-policy lints (hardcoded ~/.hermes, ANSI
-erase-to-EOL, skill frontmatter standards)."""
+erase-to-EOL, skill frontmatter standards, npm age-gate coverage)."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from lints import no_ansi_erase_eol as ansi  # noqa: E402
 from lints import no_hardcoded_hermes_home as home  # noqa: E402
+from lints import npmrc_age_gate_coverage as agegate  # noqa: E402
 from lints import skill_frontmatter_standards as skillstd  # noqa: E402
 
 # ── no-hardcoded-hermes-home ─────────────────────────────────────────────
@@ -133,3 +134,48 @@ def test_posix_script_with_platforms_passes(tmp_path):
 
 def test_skill_standards_clean_on_repo():
     assert skillstd.check() == []
+
+
+# ── npmrc-age-gate-coverage ──────────────────────────────────────────────
+
+
+def test_parses_the_declared_floor():
+    assert agegate.parse_min_age("engine-strict=true\nmin-release-age=14\n") == 14
+    assert agegate.parse_min_age("engine-strict=true\n") is None
+    # A commented-out directive is not in force.
+    assert agegate.parse_min_age("# min-release-age=14\n") is None
+
+
+def test_every_npm_project_dir_has_a_manifest_and_a_lockfile():
+    """A project is the lockfile+manifest pair npm resolves against.
+
+    A lockfile with no manifest beside it (nix/ vendors one for a
+    hash-pinned fetch) is an artifact, not a project npm ever installs.
+    """
+    for rel_dir in agegate.npm_project_dirs():
+        base = REPO_ROOT if rel_dir == "." else REPO_ROOT / rel_dir
+        assert (base / "package.json").is_file(), rel_dir
+        assert (base / "package-lock.json").is_file(), rel_dir
+
+
+def test_every_npm_project_is_age_gated_at_or_above_the_root_floor():
+    """The invariant the lint exists for, asserted directly on the tree.
+
+    npm reads only the project's own .npmrc — never a parent's — so the
+    root gate protects the root install and nothing else.
+    """
+    root_floor = agegate.parse_min_age(
+        (REPO_ROOT / ".npmrc").read_text(encoding="utf-8")
+    )
+    assert root_floor is not None, "root .npmrc must declare the standard"
+
+    for rel_dir in agegate.npm_project_dirs():
+        base = REPO_ROOT if rel_dir == "." else REPO_ROOT / rel_dir
+        npmrc = base / ".npmrc"
+        assert npmrc.is_file(), f"{rel_dir} resolves with no age gate"
+        declared = agegate.parse_min_age(npmrc.read_text(encoding="utf-8"))
+        assert declared is not None and declared >= root_floor, rel_dir
+
+
+def test_age_gate_coverage_clean_on_repo():
+    assert agegate.check() == []
