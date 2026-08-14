@@ -143,6 +143,37 @@ def test_exact_version_policy():
     assert flagged == {"caret-bad", "tilde-bad", "range-bad", "tag-bad", "star-bad", "dev-bad"}
 
 
+def test_npm_alias_is_exact_only_when_its_version_tail_is():
+    """`npm:<pkg>@<version>` re-points a dependency; the tail is the
+    specifier, so it answers to the same exactness rule."""
+    assert pjexact.is_exact("npm:@hermes/ink@0.0.1")
+    assert pjexact.is_exact("npm:image-size@2.0.3")
+    assert not pjexact.is_exact("npm:@hermes/ink@^0.0.1")
+    assert not pjexact.is_exact("npm:image-size@latest")
+
+
+def test_overrides_are_scanned_including_nested_tables():
+    """An override forces a version on every transitive consumer, so a
+    ranged override floats packages the manifest never names — a wider
+    hole than a ranged direct dependency, not a narrower one."""
+    manifest = {
+        "overrides": {
+            "pinned-ok": "1.2.3",
+            "alias-ok": "npm:@scope/fork@2.0.0",
+            "caret-bad": "^3.3.1",
+            "parent": {
+                ".": "~4.0.0",
+                "nested-bad": ">=5",
+                "nested-ok": "6.0.0",
+            },
+        },
+    }
+    problems = pjexact.non_exact_deps(manifest)
+    assert {name for _, name, _ in problems} == {"caret-bad", ".", "nested-bad"}
+    # The nested finding reports the path that locates it in the manifest.
+    assert ("overrides.parent", "nested-bad", ">=5") in problems
+
+
 def test_packagejson_exact_clean_on_repo():
     """Every tracked package.json declares exact versions (or local refs)."""
     assert pjexact.check() == []
