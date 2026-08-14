@@ -276,14 +276,18 @@ def apply_to_pyproject(text: str, actions: list[tuple[str, str, str, str | None]
     removed_all = False
 
     for key, action, _, replacement in actions:
+        # (?<![\w.-]) anchors the key's left edge: without it, removing `h2`
+        # eats the tail of `python-h2` and emits `{ python- }`, unparseable
+        # TOML. Bare \b is not enough — it does not fire between `-` and `h`.
+        key_re = rf"(?<![\w.-]){re.escape(key)}\s*=\s*"
         if action == "replace":
             body = re.sub(
-                rf"({re.escape(key)}\s*=\s*)false",
+                rf"({key_re})false",
                 lambda mm: f'{mm.group(1)}"{replacement}"',
                 body,
             )
         else:
-            body = re.sub(rf"\s*{re.escape(key)}\s*=\s*(?:false|\"[^\"]*\")\s*,?", "", body)
+            body = re.sub(rf"\s*{key_re}(?:false|\"[^\"]*\")\s*,?", "", body)
 
     body = body.strip().strip(",").strip()
     lines = text.splitlines()

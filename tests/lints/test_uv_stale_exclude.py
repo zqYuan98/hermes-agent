@@ -212,6 +212,51 @@ def test_real_repo_pyproject_parses():
 # ── apply_to_pyproject ───────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize(
+    "entries,actions",
+    [
+        # remove `h2` while `python-h2` sits beside it
+        ("python-h2 = false, h2 = \"2026-08-04T00:00:00Z\"", [("h2", "remove", "r", None)]),
+        # …and with the collider on the right of the target
+        ("h2 = \"2026-08-04T00:00:00Z\", python-h2 = false", [("h2", "remove", "r", None)]),
+        # replace must not rewrite the longer key's value either
+        ("python-h2 = false, h2 = false", [("h2", "replace", "r", "2026-09-09T00:00:00Z")]),
+    ],
+)
+def test_key_edit_does_not_eat_a_longer_key_with_the_same_suffix(entries, actions):
+    """An unanchored key regex turns `{ python-h2 = false, h2 = ... }` into
+    `{ python- }` — valid-looking line surgery, unparseable TOML."""
+    py = _pyproject(entries)
+    out = mod.apply_to_pyproject(py, actions)
+
+    table = tomllib.loads(out)["tool"]["uv"]["exclude-newer-package"]
+    assert "python-h2" in table, f"collider key was clobbered: {out!r}"
+    mod.verify_only_age_changed(
+        py, out, ("tool", "uv", "exclude-newer-package"), "pyproject"
+    )
+
+
+def test_section_form_key_edit_does_not_eat_a_longer_key():
+    py = (
+        "[project]\nname = \"fixture\"\nversion = \"0.0.0\"\n\n"
+        "[tool.uv]\nexclude-newer = \"14 days\"\n\n"
+        "[tool.uv.exclude-newer-package]\n"
+        "python-h2 = false\nh2 = \"2026-08-04T00:00:00Z\"\n"
+    )
+    out = mod.apply_to_pyproject(py, [("h2", "remove", "r", None)])
+    table = tomllib.loads(out)["tool"]["uv"]["exclude-newer-package"]
+    assert set(table) == {"python-h2"}
+
+
+def test_lock_mirror_key_edit_does_not_eat_a_longer_key():
+    lock = _lock(
+        [("h2", "4.4.1", OLD)],
+        mirror='python-h2 = false\nh2 = "2026-08-04T00:00:00Z"',
+    )
+    out = mod.apply_to_lock(lock, [("h2", "remove", "r", None)])
+    assert set(tomllib.loads(out)["options"]["exclude-newer-package"]) == {"python-h2"}
+
+
 def test_apply_replace_false_in_pyproject():
     py = _pyproject("vercel = false, h2 = false")
     actions = [("h2", "replace", "r", "2026-08-04T00:00:00Z")]
