@@ -42,9 +42,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_constants import (
+    canonical_profile_home,
     display_hermes_home,
     get_hermes_home,
-    profile_mutation_lock,
+    profile_mutation_locks,
 )
 from utils import atomic_write_text, is_truthy_value
 from hermes_cli.config import cfg_get
@@ -202,12 +203,40 @@ def _containing_skills_root(skill_path: Path) -> Path:
     return _skills_dir()
 
 
+def _skill_mutation_lock_roots() -> Tuple[Path, ...]:
+    """Return the active Profile plus every configured external Skill root.
+
+    External roots may be shared by multiple Profiles.  Locking only the
+    active Profile would therefore allow two processes to read-modify-write the
+    same external Skill concurrently under different lock identities.
+    """
+    from agent.skill_utils import get_all_skills_dirs
+
+    local_skills = canonical_profile_home(_skills_dir())
+    roots = {canonical_profile_home(_skills_dir().parent)}
+    for root in get_all_skills_dirs():
+        canonical = canonical_profile_home(root)
+        if canonical != local_skills:
+            roots.add(canonical)
+    return tuple(sorted(roots, key=str))
+
+
 def _profile_mutation_entry(func):
-    """Run one low-level Skill mutation under the active Profile lock."""
+    """Run one Skill mutation under its complete, stable root lock set."""
     @wraps(func)
     def _locked(*args, **kwargs):
-        with profile_mutation_lock(_skills_dir().parent):
-            return func(*args, **kwargs)
+        # Configuration may change while this call waits for the locks.  Never
+        # acquire a newly discovered root while retaining an older subset:
+        # release the whole sorted set and retry to avoid ABBA deadlocks.
+        for _attempt in range(4):
+            roots = _skill_mutation_lock_roots()
+            with profile_mutation_locks(roots):
+                if _skill_mutation_lock_roots() != roots:
+                    continue
+                return func(*args, **kwargs)
+        raise RuntimeError(
+            "Skill mutation roots kept changing while acquiring shared locks"
+        )
 
     return _locked
 
