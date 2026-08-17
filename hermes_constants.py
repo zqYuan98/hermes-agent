@@ -4,10 +4,16 @@ Import-safe module with no dependencies — can be imported from anywhere
 without risk of circular imports.
 """
 
+import errno
+import hashlib
 import os
 import shutil
+import socket
 import stat
 import sys
+import threading
+import time
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar, Token
 from pathlib import Path
 
@@ -225,6 +231,344 @@ def get_default_hermes_root() -> Path:
                 result = env_path
     _default_hermes_root_memo = (str(native_home), env_home, result)
     return result
+
+
+_PROFILE_MUTATION_LOCKS_GUARD = threading.Lock()
+_PROFILE_MUTATION_THREAD_LOCKS: dict[str, threading.RLock] = {}
+_PROFILE_MUTATION_HELD = threading.local()
+_PROFILE_MUTATION_KERNEL_HELD = threading.local()
+
+
+def _lexical_profile_home(profile_home: str | Path) -> Path:
+    """Normalize a Profile path without following mutable directory entries."""
+    raw = Path(profile_home).expanduser()
+    absolute = Path(os.path.abspath(os.fspath(raw)))
+    normalized = os.path.normcase(os.path.normpath(os.fspath(absolute)))
+    return Path(normalized)
+
+
+def canonical_profile_home(profile_home: str | Path) -> Path:
+    """Return the resolved filesystem identity used by Profile mutations."""
+    raw = _lexical_profile_home(profile_home)
+    try:
+        resolved = raw.resolve(strict=False)
+    except OSError:
+        resolved = raw
+    normalized = os.path.normcase(os.path.normpath(os.fspath(resolved)))
+    return Path(normalized)
+
+
+def _profile_mutation_guard_identities(profile_home: str | Path) -> tuple[str, ...]:
+    """Return stable logical and resolved guard identities for one Profile.
+
+    The lexical identity survives absent/present and symlink transitions. The
+    resolved identity makes a live symlink alias serialize with its target.
+    """
+    homes = {
+        _lexical_profile_home(profile_home),
+        canonical_profile_home(profile_home),
+    }
+    return tuple(
+        sorted(f"profile-mutation-v2:path:{os.fspath(home)}" for home in homes)
+    )
+
+
+def _profile_mutation_guard_name(identity: str) -> str:
+    """Return an unlink-proof Linux abstract-socket name for *identity*."""
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return f"\0hermes-pm-v2-{uid}-{digest}"
+
+
+def _profile_mutation_kernel_depths() -> dict[str, int]:
+    """Return thread-local reentrancy state, reset after ``fork()``."""
+    pid = os.getpid()
+    if getattr(_PROFILE_MUTATION_KERNEL_HELD, "pid", None) != pid:
+        _PROFILE_MUTATION_KERNEL_HELD.pid = pid
+        _PROFILE_MUTATION_KERNEL_HELD.depths = {}
+    return _PROFILE_MUTATION_KERNEL_HELD.depths
+
+
+def _acquire_profile_kernel_guard(
+    identity: str,
+    *,
+    deadline: float | None,
+    label: Path,
+) -> socket.socket:
+    """Bind one stable Linux kernel name within the shared timeout budget."""
+    name = _profile_mutation_guard_name(identity)
+    while True:
+        guard = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        guard.set_inheritable(False)
+        try:
+            guard.bind(name)
+            return guard
+        except OSError as exc:
+            guard.close()
+            if exc.errno != errno.EADDRINUSE:
+                raise RuntimeError(
+                    f"Unable to acquire Profile mutation kernel guard: {label}"
+                ) from exc
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Timed out waiting for Profile mutation lock: {label}"
+                ) from exc
+            time.sleep(0.05)
+
+
+@contextmanager
+def _profile_mutation_kernel_guards(
+    identities,
+    *,
+    deadline: float | None,
+    label: Path,
+):
+    """Acquire sorted, reentrant kernel guards on Linux.
+
+    Abstract UNIX-socket names cannot be renamed, unlinked, or replaced by
+    another filesystem writer. Other platforms continue to use the existing
+    file-lock protocol until they provide an equivalent stable kernel name.
+    """
+    ordered = tuple(sorted(set(identities)))
+    if not ordered or not sys.platform.startswith("linux"):
+        yield
+        return
+
+    depths = _profile_mutation_kernel_depths()
+    fresh = [identity for identity in ordered if not depths.get(identity)]
+    held = sorted(identity for identity, depth in depths.items() if depth)
+    if held and fresh and min(fresh) < max(held):
+        raise RuntimeError(
+            "Profile mutation lock order violation while acquiring a nested identity"
+        )
+
+    acquired: list[tuple[str, socket.socket | None]] = []
+    try:
+        for identity in ordered:
+            depth = depths.get(identity, 0)
+            if depth:
+                depths[identity] = depth + 1
+                acquired.append((identity, None))
+                continue
+            guard = _acquire_profile_kernel_guard(
+                identity,
+                deadline=deadline,
+                label=label,
+            )
+            depths[identity] = 1
+            acquired.append((identity, guard))
+        yield
+    finally:
+        for identity, guard in reversed(acquired):
+            depth = depths.get(identity, 0)
+            if depth <= 1:
+                depths.pop(identity, None)
+                if guard is not None:
+                    guard.close()
+            else:
+                depths[identity] = depth - 1
+
+
+def _profile_mutation_root(profile_home: Path) -> Path:
+    configured_root = canonical_profile_home(get_default_hermes_root())
+    if profile_home == configured_root:
+        return configured_root
+    try:
+        profile_home.relative_to(configured_root / "profiles")
+        return configured_root
+    except ValueError:
+        pass
+    if profile_home.parent.name == "profiles":
+        return profile_home.parent.parent
+    return configured_root
+
+
+def profile_mutation_lock_path(profile_home: str | Path) -> Path:
+    """Return the stable lock path for one canonical Profile home."""
+    canonical = canonical_profile_home(profile_home)
+    identity = f"profile-mutation-v1:{os.fspath(canonical)}"
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    root = _profile_mutation_root(canonical)
+    return root / ".locks" / "profile-mutations" / f"v1-{digest}.lock"
+
+
+def _acquire_profile_os_lock(fd: int, *, deadline: float | None, lock_path: Path) -> None:
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
+    if fcntl is not None:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except BlockingIOError:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError(f"Timed out waiting for Profile mutation lock: {lock_path}")
+                time.sleep(0.05)
+
+    try:
+        import msvcrt
+    except ImportError:
+        msvcrt = None
+    if msvcrt is None:
+        raise RuntimeError("Profile mutation locking is unsupported on this platform")
+
+    if os.fstat(fd).st_size == 0:
+        os.write(fd, b"\0")
+        os.fsync(fd)
+    while True:
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return
+        except OSError:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(f"Timed out waiting for Profile mutation lock: {lock_path}")
+            time.sleep(0.05)
+
+
+def _release_profile_os_lock(fd: int) -> None:
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return
+    import msvcrt
+
+    os.lseek(fd, 0, os.SEEK_SET)
+    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+
+@contextmanager
+def _profile_mutation_file_lock(
+    profile_home: str | Path,
+    *,
+    timeout: float | None = 30.0,
+):
+    """Acquire the legacy v1 file lock used for mixed-version compatibility."""
+    if timeout is not None and timeout < 0:
+        raise ValueError("timeout must be non-negative or None")
+    canonical = canonical_profile_home(profile_home)
+    lock_path = profile_mutation_lock_path(canonical)
+    key = os.fspath(lock_path)
+    deadline = None if timeout is None else time.monotonic() + timeout
+
+    with _PROFILE_MUTATION_LOCKS_GUARD:
+        thread_lock = _PROFILE_MUTATION_THREAD_LOCKS.setdefault(key, threading.RLock())
+    remaining = -1 if deadline is None else max(0.0, deadline - time.monotonic())
+    acquired = thread_lock.acquire() if deadline is None else thread_lock.acquire(timeout=remaining)
+    if not acquired:
+        raise TimeoutError(f"Timed out waiting for Profile mutation lock: {lock_path}")
+
+    held = getattr(_PROFILE_MUTATION_HELD, "depths", None)
+    if held is None:
+        held = {}
+        _PROFILE_MUTATION_HELD.depths = held
+    depth = held.get(key, 0)
+    if depth:
+        held[key] = depth + 1
+        try:
+            yield canonical
+        finally:
+            held[key] -= 1
+            thread_lock.release()
+        return
+
+    fd = None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            os.chmod(lock_path.parent, 0o700)
+        except OSError:
+            pass
+        flags = os.O_CREAT | os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(lock_path, flags, 0o600)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise RuntimeError(f"Profile mutation lock is not a regular file: {lock_path}")
+        try:
+            os.chmod(lock_path, 0o600)
+        except OSError:
+            pass
+        _acquire_profile_os_lock(fd, deadline=deadline, lock_path=lock_path)
+        held[key] = 1
+        try:
+            yield canonical
+        finally:
+            held.pop(key, None)
+            _release_profile_os_lock(fd)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        thread_lock.release()
+
+
+@contextmanager
+def profile_mutation_locks(
+    profile_homes,
+    *,
+    timeout: float | None = 30.0,
+):
+    """Acquire stable Profile mutation guards plus legacy file locks.
+
+    Linux first binds globally sorted abstract-socket identities for both each
+    lexical Profile path and its current resolved target. Those kernel names
+    cannot be renamed or replaced, closing split-lock races in the v1 pathname
+    lock. The v1 file locks remain underneath for mixed-version coordination.
+    ``timeout`` is one budget for the whole transaction.
+    """
+    if timeout is not None and timeout < 0:
+        raise ValueError("timeout must be non-negative or None")
+
+    raw = tuple(profile_homes)
+    if not raw:
+        yield ()
+        return
+    canonical = tuple(
+        sorted(
+            {canonical_profile_home(home) for home in raw},
+            key=os.fspath,
+        )
+    )
+    guard_identities = tuple(
+        identity
+        for home in raw
+        for identity in _profile_mutation_guard_identities(home)
+    )
+    deadline = None if timeout is None else time.monotonic() + timeout
+    label = canonical[0]
+
+    with _profile_mutation_kernel_guards(
+        guard_identities,
+        deadline=deadline,
+        label=label,
+    ):
+        with ExitStack() as stack:
+            for home in canonical:
+                remaining = (
+                    None
+                    if deadline is None
+                    else max(0.0, deadline - time.monotonic())
+                )
+                stack.enter_context(
+                    _profile_mutation_file_lock(home, timeout=remaining)
+                )
+            yield canonical
+
+
+@contextmanager
+def profile_mutation_lock(
+    profile_home: str | Path,
+    *,
+    timeout: float | None = 30.0,
+):
+    """Serialize mutations to one Profile across threads and processes."""
+    with profile_mutation_locks((profile_home,), timeout=timeout) as homes:
+        yield homes[0]
 
 
 def get_optional_skills_dir(default: Path | None = None) -> Path:

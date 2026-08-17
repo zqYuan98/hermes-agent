@@ -24,10 +24,78 @@ def profile_env(tmp_path, monkeypatch):
     return home
 
 
+def test_read_profile_meta_empty_when_missing(profile_env):
+    meta = profiles_mod.read_profile_meta(profile_env)
+    assert meta == {"description": "", "description_auto": False}
 
 
+def test_write_profile_meta_holds_target_profile_lock(profile_env, monkeypatch):
+    import contextlib
+
+    entered = []
+    state = {"active": False}
+
+    @contextlib.contextmanager
+    def tracked_lock(profile_home):
+        entered.append(Path(profile_home).resolve())
+        state["active"] = True
+        try:
+            yield
+        finally:
+            state["active"] = False
+
+    def fake_write_unlocked(profile_dir, **kwargs):
+        assert state["active"], "profile metadata RMW ran outside Profile lock"
+        assert Path(profile_dir).resolve() == profile_env.resolve()
+        assert kwargs == {"description": "locked", "description_auto": False}
+
+    monkeypatch.setattr(profiles_mod, "profile_mutation_lock", tracked_lock)
+    monkeypatch.setattr(
+        profiles_mod, "_write_profile_meta_unlocked", fake_write_unlocked, raising=False
+    )
+
+    profiles_mod.write_profile_meta(
+        profile_env, description="locked", description_auto=False
+    )
+
+    assert entered == [profile_env.resolve()]
 
 
+def test_write_and_read_profile_meta(profile_env):
+    profiles_mod.write_profile_meta(
+        profile_env,
+        description="a useful researcher",
+        description_auto=False,
+    )
+    meta = profiles_mod.read_profile_meta(profile_env)
+    assert meta["description"] == "a useful researcher"
+    assert meta["description_auto"] is False
+
+
+def test_write_profile_meta_preserves_other_fields(profile_env):
+    # First write sets description_auto=True; second write only updates
+    # description and leaves description_auto unchanged.
+    profiles_mod.write_profile_meta(
+        profile_env,
+        description="auto-gen",
+        description_auto=True,
+    )
+    profiles_mod.write_profile_meta(profile_env, description="edited by hand")
+    meta = profiles_mod.read_profile_meta(profile_env)
+    assert meta["description"] == "edited by hand"
+    assert meta["description_auto"] is True
+
+
+def test_write_profile_meta_rejects_missing_dir(tmp_path):
+    bogus = tmp_path / "does_not_exist"
+    with pytest.raises(FileNotFoundError):
+        profiles_mod.write_profile_meta(bogus, description="x")
+
+
+def test_read_profile_meta_tolerates_corrupt_yaml(profile_env):
+    (profile_env / "profile.yaml").write_text("not: valid: yaml: [unclosed")
+    meta = profiles_mod.read_profile_meta(profile_env)
+    assert meta == {"description": "", "description_auto": False}
 
 
 # ---------------------------------------------------------------------------
@@ -43,8 +111,8 @@ def _fake_aux_response(content: str):
 
 
 def _patch_aux_client(content: str):
-    # describe_profile now routes through call_llm (#35566) — mock it at the
-    # source module.
+    # describe_profile routes through call_llm so task-specific auxiliary
+    # provider/model/extra-body configuration is preserved.
     return patch(
         "agent.auxiliary_client.call_llm",
         return_value=_fake_aux_response(content),
@@ -91,3 +159,42 @@ def test_describer_refuses_to_overwrite_user_authored(profile_env, monkeypatch):
     assert profiles_mod.read_profile_meta(profile_env)["description"] == "curated"
 
 
+def test_describer_overwrite_flag_replaces_user_authored(profile_env, monkeypatch):
+    profiles_mod.write_profile_meta(
+        profile_env, description="curated", description_auto=False,
+    )
+    monkeypatch.setattr(profiles_mod, "profile_exists", lambda n: n == "myprof")
+    monkeypatch.setattr(profiles_mod, "normalize_profile_name", lambda n: n)
+    monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda n: profile_env)
+
+    payload = jsonlib.dumps({"description": "new auto-gen"})
+    with _patch_aux_client(payload), patch(
+        "agent.auxiliary_client.get_auxiliary_extra_body", return_value={}
+    ):
+        outcome = describer.describe_profile("myprof", overwrite=True)
+    assert outcome.ok, outcome.reason
+    meta = profiles_mod.read_profile_meta(profile_env)
+    assert meta["description"] == "new auto-gen"
+    assert meta["description_auto"] is True
+
+
+def test_describer_handles_malformed_llm_response(profile_env, monkeypatch):
+    monkeypatch.setattr(profiles_mod, "profile_exists", lambda n: n == "myprof")
+    monkeypatch.setattr(profiles_mod, "normalize_profile_name", lambda n: n)
+    monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda n: profile_env)
+
+    # Non-JSON: describer falls back to taking the first paragraph as the description.
+    with _patch_aux_client("Plain text description that sneaks in"), patch(
+        "agent.auxiliary_client.get_auxiliary_extra_body", return_value={}
+    ):
+        outcome = describer.describe_profile("myprof")
+    assert outcome.ok
+    assert "Plain text description" in (outcome.description or "")
+
+
+def test_describer_returns_false_when_profile_missing(profile_env, monkeypatch):
+    monkeypatch.setattr(profiles_mod, "profile_exists", lambda n: False)
+    monkeypatch.setattr(profiles_mod, "normalize_profile_name", lambda n: n)
+    outcome = describer.describe_profile("ghost")
+    assert outcome.ok is False
+    assert "not found" in outcome.reason

@@ -30,10 +30,12 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, List, Optional, Tuple
 
 from agent.skill_utils import is_excluded_skill_path
+from hermes_constants import profile_mutation_lock, profile_mutation_locks
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +81,10 @@ _CLONE_ALL_STRIP: list[str] = [
     "gateway.pid",
     "gateway_state.json",
     "processes.json",
+    # WebUI lifecycle identity belongs to one Profile incarnation and must
+    # never be inherited by a clone.  WebUI publishes a fresh UUID lazily (or
+    # at the end of its create transaction).
+    ".webui-profile-generation",
 ]
 
 # Infrastructure artifacts excluded from --clone-all when the source is the
@@ -440,20 +446,23 @@ def _is_wrapper_dir_in_path() -> bool:
 
 
 def create_wrapper_script(name: str, target: Optional[str] = None) -> Optional[Path]:
-    """Create a shell wrapper script at ~/.local/bin/<name>.
-
-    The wrapper file is named after ``name`` (the alias). The profile it
-    activates is ``target`` if given, otherwise ``name`` — this lets a custom
-    alias name point at a differently-named profile without a post-hoc rewrite.
-
-    On Windows, creates a ``.bat`` file instead of a POSIX shell script.
-    Returns the path to the created wrapper, or None if creation failed.
-    """
+    """Create an alias under the root and target Profile lifecycle locks."""
     canon = normalize_profile_name(name)
     profile = normalize_profile_name(target) if target else canon
     # The alias is used verbatim as a filename under the wrapper dir; reject
     # any value that isn't a single safe identifier so it can't traverse out.
     validate_alias_name(canon)
+    validate_profile_name(profile)
+    with profile_mutation_locks(
+        (_get_default_hermes_home(), get_profile_dir(profile))
+    ):
+        return _create_wrapper_script_unlocked(canon, profile)
+
+
+def _create_wrapper_script_unlocked(
+    canon: str, profile: str
+) -> Optional[Path]:
+    """Write one wrapper; caller must hold root and target Profile locks."""
     wrapper_dir = _get_wrapper_dir()
     try:
         wrapper_dir.mkdir(parents=True, exist_ok=True)
@@ -483,15 +492,21 @@ def create_wrapper_script(name: str, target: Optional[str] = None) -> Optional[P
 
 
 def remove_wrapper_script(name: str) -> bool:
-    """Remove the wrapper script for a profile. Returns True if removed."""
-    wrapper_dir = _get_wrapper_dir()
+    """Remove an alias while holding the root wrapper-namespace lock."""
     canon = normalize_profile_name(name)
     # A traversal-shaped name could point unlink() at a file outside the
-    # wrapper dir; refuse it rather than acting on an arbitrary path.
+    # wrapper dir; refuse it before acquiring or acting on any path.
     try:
         validate_alias_name(canon)
     except ValueError:
         return False
+    with profile_mutation_lock(_get_default_hermes_home()):
+        return _remove_wrapper_script_unlocked(canon)
+
+
+def _remove_wrapper_script_unlocked(canon: str) -> bool:
+    """Unlink one wrapper; caller must hold the root Profile lock."""
+    wrapper_dir = _get_wrapper_dir()
     is_windows = sys.platform == "win32"
 
     # Check both the extensionless path (POSIX) and .bat (Windows)
@@ -851,11 +866,25 @@ def write_profile_meta(
     description: Optional[str] = None,
     description_auto: Optional[bool] = None,
 ) -> None:
-    """Update ``<profile_dir>/profile.yaml`` in place.
+    """Update Profile metadata under the target Profile mutation lock."""
+    with profile_mutation_lock(profile_dir):
+        return _write_profile_meta_unlocked(
+            profile_dir,
+            description=description,
+            description_auto=description_auto,
+        )
 
-    Only the explicitly passed fields are overwritten; unspecified
-    fields preserve existing values. Creates the file if missing.
-    Profile directory itself must exist.
+
+def _write_profile_meta_unlocked(
+    profile_dir: Path,
+    *,
+    description: Optional[str] = None,
+    description_auto: Optional[bool] = None,
+) -> None:
+    """Update ``profile.yaml``; caller must hold the Profile mutation lock.
+
+    Only explicitly passed fields are overwritten; unspecified fields preserve
+    existing values. Creates the file if missing. Profile directory must exist.
     """
     if not profile_dir.is_dir():
         raise FileNotFoundError(f"profile directory does not exist: {profile_dir}")
@@ -1028,7 +1057,7 @@ def profiles_to_serve(
     return serve
 
 
-def create_profile(
+def _create_profile_unlocked(
     name: str,
     clone_from: Optional[str] = None,
     clone_all: bool = False,
@@ -1221,16 +1250,54 @@ def create_profile(
     return profile_dir
 
 
+def create_profile(
+    name: str,
+    clone_from: Optional[str] = None,
+    clone_all: bool = False,
+    clone_config: bool = False,
+    no_alias: bool = False,
+    no_skills: bool = False,
+    description: Optional[str] = None,
+) -> Path:
+    """Create a Profile while serializing its source and destination trees."""
+    canon = normalize_profile_name(name)
+    validate_profile_name(canon)
+    destination = get_profile_dir(canon)
+
+    source = None
+    if clone_from is not None or clone_all or clone_config:
+        if clone_from is None:
+            from hermes_constants import get_hermes_home
+
+            source = get_hermes_home()
+        else:
+            source_name = normalize_profile_name(clone_from)
+            validate_profile_name(source_name)
+            source = get_profile_dir(source_name)
+
+    homes = [_get_default_hermes_home()]
+    if source is not None:
+        homes.append(source)
+    homes.append(destination)
+    with profile_mutation_locks(homes):
+        return _create_profile_unlocked(
+            canon,
+            clone_from=clone_from,
+            clone_all=clone_all,
+            clone_config=clone_config,
+            no_alias=no_alias,
+            no_skills=no_skills,
+            description=description,
+        )
+
+
 def seed_profile_skills(profile_dir: Path, quiet: bool = False) -> Optional[dict]:
-    """Seed bundled skills into a profile via subprocess.
+    """Seed bundled skills into one explicitly scoped Profile in-process.
 
-    Uses subprocess because sync_skills() caches HERMES_HOME at module level.
-    Returns the sync result dict, or None on failure.
-
-    Profiles that opted out of bundled skills (via ``hermes profile create
-    --no-skills`` — which writes ``.no-bundled-skills`` to the profile root)
-    are skipped and get an empty-result dict so callers can report
-    "opted out" instead of "failed".
+    The scoped sync is safe when a lifecycle transaction already holds the
+    same Profile mutation lock; the shared lock helper is same-thread
+    reentrant.  Profiles carrying the opt-out marker are skipped before the
+    sync import so minimal/profile-management environments remain lightweight.
     """
     if has_bundled_skills_opt_out(profile_dir):
         return {
@@ -1239,31 +1306,43 @@ def seed_profile_skills(profile_dir: Path, quiet: bool = False) -> Optional[dict
             "user_modified": [],
             "skipped_opt_out": True,
         }
-    project_root = Path(__file__).parent.parent.resolve()
     try:
-        result = subprocess.run(
-            [sys.executable, "-c",
-             "import json; from tools.skills_sync import sync_skills; "
-             "r = sync_skills(quiet=True); print(json.dumps(r))"],
-            env={**os.environ, "HERMES_HOME": str(profile_dir)},
-            cwd=str(project_root),
-            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=60,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return json.loads(result.stdout.strip())
-        if not quiet:
-            print(f"⚠ Skill seeding returned exit code {result.returncode}")
-            if result.stderr.strip():
-                print(f"  {result.stderr.strip()[:200]}")
-        return None
-    except subprocess.TimeoutExpired:
-        if not quiet:
-            print("⚠ Skill seeding timed out (60s)")
-        return None
+        from tools.skills_sync import sync_skills_for_profile
+
+        return sync_skills_for_profile(profile_dir, quiet=True)
     except Exception as e:
         if not quiet:
             print(f"⚠ Skill seeding failed: {e}")
         return None
+
+
+def _backfill_profile_env_unlocked(
+    entry: Path, default_env: Path, quiet: bool
+) -> bool:
+    """Backfill one Profile; caller must hold root and target locks."""
+    if not entry.is_dir() or not _PROFILE_ID_RE.match(entry.name):
+        return False
+    if entry.name == "default":
+        return False
+    env_path = entry / ".env"
+    if env_path.exists():
+        return False
+    try:
+        if default_env.is_file():
+            shutil.copy2(default_env, env_path)
+        else:
+            env_path.write_text(
+                "# Per-profile secrets for this Hermes profile.\n"
+                "# API keys and tokens set here override the shell environment.\n"
+                "# Behavioral settings belong in config.yaml, not here.\n",
+                encoding="utf-8",
+            )
+        os.chmod(str(env_path), 0o600)
+        return True
+    except OSError as e:
+        if not quiet:
+            print(f"⚠ Could not seed .env for profile '{entry.name}': {e}")
+        return False
 
 
 def backfill_profile_envs(quiet: bool = False) -> List[str]:
@@ -1289,31 +1368,15 @@ def backfill_profile_envs(quiet: bool = False) -> List[str]:
     if not profiles_root.is_dir():
         return backfilled
 
-    default_env = _get_default_hermes_home() / ".env"
+    default_home = _get_default_hermes_home()
+    default_env = default_home / ".env"
 
     for entry in sorted(profiles_root.iterdir()):
-        if not entry.is_dir() or not _PROFILE_ID_RE.match(entry.name):
-            continue
-        if entry.name == "default":
-            continue
-        env_path = entry / ".env"
-        if env_path.exists():
-            continue
-        try:
-            if default_env.is_file():
-                shutil.copy2(default_env, env_path)
-            else:
-                env_path.write_text(
-                    "# Per-profile secrets for this Hermes profile.\n"
-                    "# API keys and tokens set here override the shell environment.\n"
-                    "# Behavioral settings belong in config.yaml, not here.\n",
-                    encoding="utf-8",
-                )
-            os.chmod(str(env_path), 0o600)
-            backfilled.append(entry.name)
-        except OSError as e:
-            if not quiet:
-                print(f"⚠ Could not seed .env for profile '{entry.name}': {e}")
+        # The enumeration is only a hint.  Re-check the directory, name and
+        # destination .env after acquiring root+target lifecycle locks.
+        with profile_mutation_locks((default_home, entry)):
+            if _backfill_profile_env_unlocked(entry, default_env, quiet):
+                backfilled.append(entry.name)
 
     return backfilled
 
@@ -1531,6 +1594,15 @@ def _rmtree_with_retry(profile_dir: Path, onexc_handler) -> None:
 
 
 def delete_profile(name: str, yes: bool = False) -> Path:
+    """Delete a Profile under one sorted root/target lifecycle transaction."""
+    canon = normalize_profile_name(name)
+    validate_profile_name(canon)
+    profile_dir = get_profile_dir(canon)
+    with profile_mutation_locks((_get_default_hermes_home(), profile_dir)):
+        return _delete_profile_unlocked(canon, yes=yes)
+
+
+def _delete_profile_unlocked(name: str, yes: bool = False) -> Path:
     """Delete a profile, its wrapper script, and its gateway service.
 
     Stops the gateway if running. Disables systemd/launchd service first
@@ -1875,10 +1947,18 @@ def get_active_profile() -> str:
 
 
 def set_active_profile(name: str) -> None:
-    """Set the sticky active profile.
+    """Set the sticky pointer under root and optional target Profile locks."""
+    canon = normalize_profile_name(name)
+    validate_profile_name(canon)
+    homes = [_get_default_hermes_home()]
+    if canon != "default":
+        homes.append(get_profile_dir(canon))
+    with profile_mutation_locks(homes):
+        return _set_active_profile_unlocked(canon)
 
-    Writes to ``~/.hermes/active_profile``. Use ``"default"`` to clear.
-    """
+
+def _set_active_profile_unlocked(name: str) -> None:
+    """Set ``active_profile``; caller must hold root and target locks."""
     canon = normalize_profile_name(name)
     validate_profile_name(canon)
     if canon != "default" and not profile_exists(canon):
@@ -2058,17 +2138,33 @@ def _scrub_export_secrets(staged: Path) -> None:
         path.write_text(redacted, encoding="utf-8")
 
 
-def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, str]] = None) -> Path:
-    """Export a profile to a tar.gz archive.
+def export_profile(
+    name: str,
+    output_path: str,
+    extra_files: Optional[Dict[str, str]] = None,
+) -> Path:
+    """Export a consistent, redacted snapshot under the source Profile lock.
 
-    ``extra_files`` maps root-relative filenames (e.g. ``desktop.json``) to
-    text content staged into the archive alongside the profile's own files —
-    the desktop app uses it to bundle its appearance/interface overlay.
-
-    Credential files (``auth.json``, ``.env``) are excluded, and secret-shaped
-    strings in staged text files are force-redacted before the archive is
-    written. Returns the output file path.
+    ``extra_files`` maps safe root-relative filenames to text staged into the
+    archive. Credential files remain excluded and staged text is force-redacted.
     """
+    canon = normalize_profile_name(name)
+    validate_profile_name(canon)
+    profile_dir = get_profile_dir(canon)
+    with profile_mutation_lock(profile_dir):
+        if extra_files is None:
+            return _export_profile_unlocked(canon, output_path)
+        return _export_profile_unlocked(
+            canon, output_path, extra_files=extra_files
+        )
+
+
+def _export_profile_unlocked(
+    name: str,
+    output_path: str,
+    extra_files: Optional[Dict[str, str]] = None,
+) -> Path:
+    """Export a profile; caller holds the source Profile mutation lock."""
     import tempfile
 
     canon = normalize_profile_name(name)
@@ -2105,15 +2201,21 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
             result = _make_profile_archive(base, tmpdir, "default")
             return Path(result)
 
-    # Named profiles — stage a filtered copy to exclude credentials
+    # Named profiles — stage a filtered copy to exclude credentials and the
+    # private WebUI incarnation token.  Importing the archive creates a new
+    # Profile incarnation and must receive a fresh generation.
     with tempfile.TemporaryDirectory() as tmpdir:
         staged = Path(tmpdir) / canon
-        _CREDENTIAL_FILES = {"auth.json", ".env"}
+        excluded_root = {"auth.json", ".env", ".webui-profile-generation"}
+
+        def _ignore_named_export(directory: str, contents: list[str]) -> set[str]:
+            return excluded_root & set(contents) if Path(directory) == profile_dir else set()
+
         shutil.copytree(
             profile_dir,
             staged,
             symlinks=True,
-            ignore=lambda d, contents: _CREDENTIAL_FILES & set(contents),
+            ignore=_ignore_named_export,
         )
         _stage_extras(staged)
         _scrub_export_secrets(staged)
@@ -2198,12 +2300,30 @@ def _inspect_profile_archive_roots(archive: Path) -> set[str]:
     return top_dirs
 
 
-def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
-    """Import a profile from a tar.gz archive.
+def _publish_imported_profile_unlocked(
+    canon: str, final_source: Path, profile_dir: Path
+) -> Path:
+    """Publish a privately staged import while root/destination locks are held."""
+    if profile_dir.exists():
+        raise FileExistsError(f"Profile '{canon}' already exists at {profile_dir}")
 
-    If *name* is not given, infers it from the archive's top-level directory.
-    Returns the imported profile directory.
-    """
+    profiles_root = _get_profiles_root()
+    profiles_root.mkdir(parents=True, exist_ok=True)
+
+    # Older or hand-built archives may contain a WebUI generation token.
+    # Import creates a new incarnation, so never publish the source identity.
+    generation_path = final_source / ".webui-profile-generation"
+    if generation_path.exists() or generation_path.is_symlink():
+        if generation_path.is_symlink() or not generation_path.is_file():
+            raise ValueError("Profile archive generation must be a regular file")
+        generation_path.unlink()
+
+    shutil.move(str(final_source), str(profile_dir))
+    return profile_dir
+
+
+def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
+    """Stage an archive privately, then publish under root/destination locks."""
     import tempfile
 
     archive = Path(archive_path)
@@ -2235,11 +2355,6 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
         )
 
     profile_dir = get_profile_dir(canon)
-    if profile_dir.exists():
-        raise FileExistsError(f"Profile '{canon}' already exists at {profile_dir}")
-
-    profiles_root = _get_profiles_root()
-    profiles_root.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="hermes_profile_import_") as tmpdir:
         staging_root = Path(tmpdir)
@@ -2256,9 +2371,12 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
             final_source = staging_root / canon
             extracted.rename(final_source)
 
-        shutil.move(str(final_source), str(profile_dir))
-
-    return profile_dir
+        with profile_mutation_locks(
+            (_get_default_hermes_home(), profile_dir)
+        ):
+            return _publish_imported_profile_unlocked(
+                canon, final_source, profile_dir
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -2326,6 +2444,20 @@ def _migrate_honcho_profile_host(old_name: str, new_name: str, new_dir: Path) ->
 
 
 def rename_profile(old_name: str, new_name: str) -> Path:
+    """Rename a Profile under one sorted root/old/new lifecycle transaction."""
+    old_canon = normalize_profile_name(old_name)
+    new_canon = normalize_profile_name(new_name)
+    validate_profile_name(old_canon)
+    validate_profile_name(new_canon)
+    old_dir = get_profile_dir(old_canon)
+    new_dir = get_profile_dir(new_canon)
+    with profile_mutation_locks(
+        (_get_default_hermes_home(), old_dir, new_dir)
+    ):
+        return _rename_profile_unlocked(old_canon, new_canon)
+
+
+def _rename_profile_unlocked(old_name: str, new_name: str) -> Path:
     """Rename a profile: directory, wrapper script, service, active_profile.
 
     Returns the new profile directory.

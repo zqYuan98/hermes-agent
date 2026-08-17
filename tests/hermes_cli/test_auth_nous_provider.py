@@ -564,6 +564,38 @@ class TestLoginNousSkipKeepsCurrent:
         # Existing openrouter creds still intact
         assert auth_after["providers"]["openrouter"]["api_key"] == "sk-or-fake"
 
+    def test_skip_does_not_restore_over_concurrent_provider_choice(
+        self, tmp_path, monkeypatch
+    ):
+        """A provider chosen while the long OAuth flow is open must win."""
+        import argparse
+        from hermes_cli.auth import PROVIDER_REGISTRY, _login_nous
+
+        _home, _config_path, auth_path = self._setup_home_with_openrouter(
+            tmp_path, monkeypatch,
+        )
+        self._patch_login_internals(monkeypatch, prompt_returns=None)
+
+        def concurrent_choice(*_args, **_kwargs):
+            payload = json.loads(auth_path.read_text(encoding="utf-8"))
+            payload["active_provider"] = "anthropic"
+            auth_path.write_text(json.dumps(payload), encoding="utf-8")
+            return None
+
+        monkeypatch.setattr(
+            "hermes_cli.auth._prompt_model_selection", concurrent_choice
+        )
+        args = argparse.Namespace(
+            portal_url=None, inference_url=None, client_id=None, scope=None,
+            no_browser=True, timeout=15.0, ca_bundle=None, insecure=False,
+        )
+
+        _login_nous(args, PROVIDER_REGISTRY["nous"])
+
+        auth_after = json.loads(auth_path.read_text(encoding="utf-8"))
+        assert auth_after["active_provider"] == "anthropic"
+        assert "nous" in auth_after["providers"]
+
     def test_picking_model_switches_to_nous(self, tmp_path, monkeypatch):
         """User picks a Nous model → provider flips to nous with that model."""
         import argparse
@@ -590,6 +622,135 @@ class TestLoginNousSkipKeepsCurrent:
 
         auth_after = json.loads(auth_path.read_text())
         assert auth_after["active_provider"] == "nous"
+
+    def test_picking_model_commits_to_frozen_start_profile(
+        self, tmp_path, monkeypatch
+    ):
+        """Ambient HERMES_HOME drift cannot redirect a completed OAuth flow."""
+        import argparse
+        import yaml
+        from hermes_cli.auth import PROVIDER_REGISTRY, _login_nous
+
+        home_a, config_a, auth_a = self._setup_home_with_openrouter(
+            tmp_path, monkeypatch,
+        )
+        home_b = tmp_path / "other-profile"
+        home_b.mkdir()
+        config_b = home_b / "config.yaml"
+        config_b.write_text(
+            yaml.safe_dump({
+                "model": {"provider": "anthropic", "default": "claude-b"}
+            }),
+            encoding="utf-8",
+        )
+        auth_b = home_b / "auth.json"
+        auth_b.write_text(
+            json.dumps({
+                "version": 1,
+                "active_provider": "anthropic",
+                "providers": {"anthropic": {"api_key": "b-key"}},
+            }),
+            encoding="utf-8",
+        )
+        self._patch_login_internals(
+            monkeypatch, prompt_returns="xiaomi/mimo-v2-pro"
+        )
+
+        def drift_then_select(*_args, **_kwargs):
+            monkeypatch.setenv("HERMES_HOME", str(home_b))
+            return "xiaomi/mimo-v2-pro"
+
+        monkeypatch.setattr(
+            "hermes_cli.auth._prompt_model_selection", drift_then_select
+        )
+        args = argparse.Namespace(
+            portal_url=None, inference_url=None, client_id=None, scope=None,
+            no_browser=True, timeout=15.0, ca_bundle=None, insecure=False,
+        )
+
+        _login_nous(args, PROVIDER_REGISTRY["nous"])
+
+        cfg_a = yaml.safe_load(config_a.read_text(encoding="utf-8"))
+        store_a = json.loads(auth_a.read_text(encoding="utf-8"))
+        cfg_b = yaml.safe_load(config_b.read_text(encoding="utf-8"))
+        store_b = json.loads(auth_b.read_text(encoding="utf-8"))
+        assert cfg_a["model"] == {
+            "provider": "nous",
+            "default": "xiaomi/mimo-v2-pro",
+            "base_url": "https://inference-api.nousresearch.com",
+        }
+        assert store_a["active_provider"] == "nous"
+        assert cfg_b["model"] == {
+            "provider": "anthropic",
+            "default": "claude-b",
+        }
+        assert store_b["active_provider"] == "anthropic"
+
+    def test_recreated_start_profile_rejects_stale_oauth_commit(
+        self, tmp_path, monkeypatch
+    ):
+        """A long OAuth flow must not write into a same-name replacement Profile."""
+        import argparse
+        import yaml
+        from hermes_cli import auth as auth_mod
+
+        home, _config_path, _auth_path = self._setup_home_with_openrouter(
+            tmp_path, monkeypatch
+        )
+        (home / ".webui-profile-generation").write_text(
+            "11111111-1111-4111-8111-111111111111\n",
+            encoding="ascii",
+        )
+        self._patch_login_internals(
+            monkeypatch, prompt_returns="xiaomi/mimo-v2-pro"
+        )
+
+        replacement_config = yaml.safe_dump(
+            {"model": {"provider": "anthropic", "default": "claude-b"}},
+            sort_keys=False,
+        )
+        replacement_auth = json.dumps(
+            {
+                "version": 1,
+                "active_provider": "anthropic",
+                "providers": {"anthropic": {"api_key": "replacement-key"}},
+            }
+        )
+        retired = home.with_name("hermes-retired")
+
+        def recreate_then_return(**_kwargs):
+            home.rename(retired)
+            home.mkdir()
+            (home / ".webui-profile-generation").write_text(
+                "22222222-2222-4222-8222-222222222222\n",
+                encoding="ascii",
+            )
+            (home / "config.yaml").write_text(
+                replacement_config, encoding="utf-8"
+            )
+            (home / "auth.json").write_text(replacement_auth, encoding="utf-8")
+            return {
+                "access_token": "fake-nous-token",
+                "agent_key": "fake-agent-key",
+                "inference_base_url": "https://inference-api.nousresearch.com",
+                "portal_base_url": "https://portal.nousresearch.com",
+                "refresh_token": "fake-refresh",
+                "token_expires_at": 9999999999,
+            }
+
+        monkeypatch.setattr(auth_mod, "_nous_device_code_login", recreate_then_return)
+        args = argparse.Namespace(
+            portal_url=None, inference_url=None, client_id=None, scope=None,
+            no_browser=True, timeout=15.0, ca_bundle=None, insecure=False,
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            auth_mod._login_nous(args, auth_mod.PROVIDER_REGISTRY["nous"])
+
+        assert exc_info.value.code == 1
+        assert (home / "config.yaml").read_text(encoding="utf-8") == replacement_config
+        assert (home / "auth.json").read_text(encoding="utf-8") == replacement_auth
+        assert "nous" not in json.loads(replacement_auth)["providers"]
 
     def test_skip_with_no_prior_active_provider_clears_it(self, tmp_path, monkeypatch):
         """Fresh install (no prior active_provider) → Skip clears active_provider

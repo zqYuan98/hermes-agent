@@ -19,12 +19,19 @@ import tempfile
 import threading
 import time
 import zipfile
-from contextlib import contextmanager
 from datetime import datetime, timezone
-from pathlib import Path
+from contextlib import contextmanager
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional
 
-from hermes_constants import get_default_hermes_root, get_hermes_home, display_hermes_home
+from hermes_cli.sizefmt import format_bytes as _format_size
+from hermes_constants import (
+    display_hermes_home,
+    get_default_hermes_root,
+    get_hermes_home,
+    profile_mutation_lock,
+    profile_mutation_locks,
+)
 from utils import (
     _preserve_file_mode,
     _preserve_file_owner,
@@ -32,10 +39,6 @@ from utils import (
     _restore_file_owner,
     atomic_replace,
 )
-
-# Shared formatter; the private alias is kept because claw.py and the backup
-# tests import ``_format_size`` from this module.
-from hermes_cli.sizefmt import format_bytes as _format_size
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +104,10 @@ _EXCLUDED_NAMES = {
     ".backup.lock",
     "gateway.pid",
     "cron.pid",
+    # Private WebUI incarnation identity is local lifecycle metadata, not
+    # portable user data.  Restores must preserve the target's live token (or
+    # let a newly imported Profile lazily mint a fresh one).
+    ".webui-profile-generation",
 }
 
 # File names that ``hermes import`` must never overwrite, matched by basename so
@@ -134,6 +141,7 @@ _IMPORT_SKIP_NAMES = {
     "cron.pid",
     "gateway.lock",
     "processes.json",
+    ".webui-profile-generation",
 }
 
 # zipfile.open() drops Unix mode bits on extract; restore tightens these to 0600.
@@ -625,6 +633,7 @@ def copy_db_and_verify(src: Path, dst: Path) -> bool:
 # Backup
 # ---------------------------------------------------------------------------
 
+
 def run_backup(args) -> None:
     """Create a zip backup of the Hermes home directory."""
     hermes_root = get_default_hermes_root()
@@ -1018,6 +1027,135 @@ def _extract_member_atomically(
         except OSError:
             pass
         raise
+def _import_profile_lock_homes(
+    hermes_root: Path, members: List[str], prefix: str
+) -> List[Path]:
+    """Return root plus every named Profile touched by archive members."""
+    profiles_root = hermes_root / "profiles"
+    try:
+        profiles_root_resolved = profiles_root.resolve(strict=False)
+    except (OSError, ValueError):
+        profiles_root_resolved = profiles_root.absolute()
+
+    named: Dict[str, Path] = {}
+    for member in members:
+        if member.startswith(_EXTERNAL_PREFIX):
+            continue
+        rel = member[len(prefix):] if prefix and member.startswith(prefix) else member
+        if not rel:
+            continue
+        parts = PurePosixPath(rel.replace("\\", "/")).parts
+        if len(parts) < 2 or parts[0] != "profiles":
+            continue
+        profile_name = parts[1]
+        if profile_name in {"", ".", ".."}:
+            continue
+        candidate = profiles_root / profile_name
+        try:
+            resolved = candidate.resolve(strict=False)
+        except (OSError, ValueError):
+            continue
+        # Only direct children of profiles/ receive a named-Profile lock.
+        # Traversal-shaped members resolve elsewhere and remain covered by the
+        # root lock until the extraction path guard rejects them.
+        if resolved.parent != profiles_root_resolved:
+            continue
+        named[os.fspath(resolved)] = candidate
+
+    return [
+        hermes_root,
+        *(named[key] for key in sorted(named)),
+    ]
+
+
+def _restore_backup_members_unlocked(
+    zf: zipfile.ZipFile,
+    members: List[str],
+    prefix: str,
+    hermes_root: Path,
+) -> tuple[List[str], int, int, List[str], float]:
+    """Restore archive members; caller must hold all returned Profile locks."""
+    hermes_root.mkdir(parents=True, exist_ok=True)
+    errors: List[str] = []
+    restored = 0
+    restored_external = 0
+    skipped_runtime: List[str] = []
+    home_dir = Path.home().resolve()
+    file_count = len(members)
+    t0 = time.monotonic()
+    new_file_mode = _default_new_file_mode()
+
+    for member in members:
+        # External memory-provider state captured under the reserved
+        # ``_external/`` arc prefix restores to its original home-relative
+        # location (e.g. ~/.honcho/config.json), NOT under HERMES_HOME.
+        if member.startswith(_EXTERNAL_PREFIX):
+            ext_rel = member[len(_EXTERNAL_PREFIX):]
+            if not ext_rel:
+                continue
+            target = home_dir / ext_rel
+            try:
+                target.resolve().relative_to(home_dir)
+            except ValueError:
+                errors.append(f"  {member}: path traversal blocked")
+                continue
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                _extract_member_atomically(
+                    zf, member, target, new_file_mode
+                )
+                if (
+                    target.suffix in {".json", ".env", ".conf"}
+                    or target.name in _SECRET_FILE_NAMES
+                ):
+                    try:
+                        os.chmod(target, 0o600)
+                    except OSError:
+                        pass
+                restored += 1
+                restored_external += 1
+            except (PermissionError, OSError) as exc:
+                errors.append(f"  {member}: {exc}")
+            if restored % 500 == 0:
+                print(f"  {restored}/{file_count} files ...")
+            continue
+
+        rel = member[len(prefix):] if prefix and member.startswith(prefix) else member
+        if not rel:
+            continue
+
+        # Never restore machine-local runtime state or WebUI incarnation
+        # identity.  Basename matching also covers named Profiles.
+        if Path(rel).name in _IMPORT_SKIP_NAMES:
+            skipped_runtime.append(rel)
+            continue
+
+        target = hermes_root / rel
+        try:
+            target.resolve().relative_to(hermes_root.resolve())
+        except ValueError:
+            errors.append(f"  {rel}: path traversal blocked")
+            continue
+
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _extract_member_atomically(zf, member, target, new_file_mode)
+            if target.name in _SECRET_FILE_NAMES:
+                os.chmod(target, 0o600)
+            restored += 1
+        except (PermissionError, OSError) as exc:
+            errors.append(f"  {rel}: {exc}")
+
+        if restored % 500 == 0:
+            print(f"  {restored}/{file_count} files ...")
+
+    return (
+        errors,
+        restored,
+        restored_external,
+        skipped_runtime,
+        time.monotonic() - t0,
+    )
 
 
 def run_import(args) -> None:
@@ -1069,93 +1207,21 @@ def run_import(args) -> None:
                 print("Aborted.")
                 return
 
-        # Extract
+        # Confirmation is complete.  Acquire root plus every named Profile the
+        # archive can touch in one deterministic transaction, then restore.  Do
+        # not rebuild wrappers until after this lock set is released.
         print(f"\nImporting {file_count} files ...")
-        hermes_root.mkdir(parents=True, exist_ok=True)
-
-        errors = []
-        restored = 0
-        restored_external = 0
-        skipped_runtime: list[str] = []
-        home_dir = Path.home().resolve()
-        # Resolved once: every member is published via a temp file, and mkstemp
-        # would otherwise create newly restored files as 0600.
-        new_file_mode = _default_new_file_mode()
-        t0 = time.monotonic()
-
-        for member in members:
-            # External memory-provider state captured under the reserved
-            # ``_external/`` arc prefix restores to its original home-relative
-            # location (e.g. ~/.honcho/config.json), NOT under HERMES_HOME.
-            if member.startswith(_EXTERNAL_PREFIX):
-                ext_rel = member[len(_EXTERNAL_PREFIX):]
-                if not ext_rel:
-                    continue
-                target = home_dir / ext_rel
-                # Security: the resolved target must stay under the home dir.
-                try:
-                    target.resolve().relative_to(home_dir)
-                except ValueError:
-                    errors.append(f"  {member}: path traversal blocked")
-                    continue
-                try:
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    _extract_member_atomically(zf, member, target, new_file_mode)
-                    # External provider configs commonly hold credentials.
-                    if target.suffix in {".json", ".env", ".conf"} or target.name in _SECRET_FILE_NAMES:
-                        try:
-                            os.chmod(target, 0o600)
-                        except OSError:
-                            pass
-                    restored += 1
-                    restored_external += 1
-                except (PermissionError, OSError) as exc:
-                    errors.append(f"  {member}: {exc}")
-                if restored % 500 == 0:
-                    print(f"  {restored}/{file_count} files ...")
-                continue
-
-            # Strip prefix if detected
-            if prefix and member.startswith(prefix):
-                rel = member[len(prefix):]
-            else:
-                rel = member
-
-            if not rel:
-                continue
-
-            # Never overwrite volatile gateway/process runtime state. These are
-            # namespaced to the machine/container the backup was taken on;
-            # clobbering them (especially gateway_state.json) breaks the gateway
-            # reconciler on the target and disconnects hosted instances from the
-            # Nous portal. Matched by basename so both the root profile and
-            # named profiles (profiles/<name>/gateway_state.json) are covered.
-            if Path(rel).name in _IMPORT_SKIP_NAMES:
-                skipped_runtime.append(rel)
-                continue
-
-            target = hermes_root / rel
-
-            # Security: reject absolute paths and traversals
-            try:
-                target.resolve().relative_to(hermes_root.resolve())
-            except ValueError:
-                errors.append(f"  {rel}: path traversal blocked")
-                continue
-
-            try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                _extract_member_atomically(zf, member, target, new_file_mode)
-                if target.name in _SECRET_FILE_NAMES:
-                    os.chmod(target, 0o600)
-                restored += 1
-            except (PermissionError, OSError) as exc:
-                errors.append(f"  {rel}: {exc}")
-
-            if restored % 500 == 0:
-                print(f"  {restored}/{file_count} files ...")
-
-        elapsed = time.monotonic() - t0
+        lock_homes = _import_profile_lock_homes(hermes_root, members, prefix)
+        with profile_mutation_locks(lock_homes):
+            (
+                errors,
+                restored,
+                restored_external,
+                skipped_runtime,
+                elapsed,
+            ) = _restore_backup_members_unlocked(
+                zf, members, prefix, hermes_root
+            )
 
         # Summary
         print()
@@ -1238,12 +1304,10 @@ def run_import(args) -> None:
             for pname in gw_profiles:
                 print(f"  hermes -p {pname} gateway install")
 
-        # Bring the restored install to life: the backup may contain bot
-        # tokens and registered cron jobs, but they're inert without a
-        # gateway process. Install/start the service automatically (a
-        # platform-less gateway is a supported mode, so this is safe even
-        # for backups with no messaging config). Best-effort and prompt-free;
-        # failures print a manual fallback and never fail the import.
+        # A restored install may contain bot tokens and registered cron jobs,
+        # but they remain inert without a gateway process. Bring the default
+        # gateway service up best-effort and without prompting; named Profile
+        # services retain the explicit guidance above.
         try:
             from hermes_cli.gateway import ensure_gateway_service, _is_service_running
 
@@ -1318,13 +1382,34 @@ def create_quick_snapshot(
 ) -> Optional[str]:
     """Create one atomic quick snapshot while holding the shared backup slot."""
     home = hermes_home or get_hermes_home()
-    with _backup_operation_lock(home):
-        return _create_quick_snapshot_locked(
-            label=label,
-            hermes_home=home,
-            keep=keep,
-            max_file_size=max_file_size,
-        )
+    with profile_mutation_lock(home):
+        with _backup_operation_lock(home):
+            return _create_quick_snapshot_unlocked(
+                label=label,
+                hermes_home=home,
+                keep=keep,
+                max_file_size=max_file_size,
+            )
+
+
+def _create_quick_snapshot_unlocked(
+    *,
+    label: Optional[str],
+    hermes_home: Path,
+    keep: Optional[int],
+    max_file_size: Optional[int] = None,
+) -> Optional[str]:
+    """Create a quick snapshot while the caller holds both snapshot locks.
+
+    This preserves the local Profile transaction boundary while reusing the
+    upstream single-flight implementation and its size-limit behavior.
+    """
+    return _create_quick_snapshot_locked(
+        label=label,
+        hermes_home=hermes_home,
+        keep=keep,
+        max_file_size=max_file_size,
+    )
 
 
 def _create_quick_snapshot_locked(
@@ -1584,12 +1669,22 @@ def restore_quick_snapshot(
     snapshot_id: str,
     hermes_home: Optional[Path] = None,
 ) -> bool:
-    """Restore state from a quick snapshot.
-
-    Overwrites current state files with the snapshot's copies.
-    Returns True if at least one file was restored.
-    """
+    """Restore a quick snapshot under the current Profile lock."""
     home = hermes_home or get_hermes_home()
+    with profile_mutation_lock(home):
+        return _restore_quick_snapshot_unlocked(
+            snapshot_id,
+            hermes_home=home,
+        )
+
+
+def _restore_quick_snapshot_unlocked(
+    snapshot_id: str,
+    *,
+    hermes_home: Path,
+) -> bool:
+    """Restore snapshot files; caller must hold the Profile lock."""
+    home = hermes_home
     root = _quick_snapshot_root(home)
 
     # Security: reject snapshot_id values that contain path separators or
@@ -1676,11 +1771,7 @@ def _count_cron_jobs(path: Path) -> Optional[int]:
     if not path.is_file():
         return None
     try:
-        # utf-8-sig: same dialect as cron/jobs.load_jobs — Windows editors
-        # may leave a UTF-8 BOM that plain utf-8 json.load rejects. Without
-        # it a BOM'd jobs.json counts as "unreadable" (None) and the
-        # post-update cron-loss auto-restore safety net silently disables.
-        with open(path, "r", encoding="utf-8-sig") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
@@ -1696,7 +1787,21 @@ def restore_cron_jobs_if_emptied(
     snapshot_id: str,
     hermes_home: Optional[Path] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Safety net for silent cron-job loss across ``hermes update``.
+    """Run the cron-loss restore decision under the current Profile lock."""
+    home = hermes_home or get_hermes_home()
+    with profile_mutation_lock(home):
+        return _restore_cron_jobs_if_emptied_unlocked(
+            snapshot_id,
+            hermes_home=home,
+        )
+
+
+def _restore_cron_jobs_if_emptied_unlocked(
+    snapshot_id: str,
+    *,
+    hermes_home: Path,
+) -> Optional[Dict[str, Any]]:
+    """Safety net for silent cron-job loss; caller holds the Profile lock.
 
     Config-version migrations have been observed to leave ``cron/jobs.json``
     valid-but-empty after an update, silently dropping every scheduled job
@@ -1798,8 +1903,10 @@ def prune_quick_snapshots(
     keep: int = _QUICK_DEFAULT_KEEP,
     hermes_home: Optional[Path] = None,
 ) -> int:
-    """Manually prune quick snapshots. Returns count deleted."""
-    return _prune_quick_snapshots(_quick_snapshot_root(hermes_home), keep=keep)
+    """Manually prune quick snapshots under the current Profile lock."""
+    home = hermes_home or get_hermes_home()
+    with profile_mutation_lock(home):
+        return _prune_quick_snapshots(_quick_snapshot_root(home), keep=keep)
 
 
 def run_quick_backup(args) -> None:
@@ -1820,10 +1927,11 @@ def run_quick_backup(args) -> None:
 # ---------------------------------------------------------------------------
 
 def _write_full_zip_backup(out_path: Path, hermes_root: Path) -> Optional[Path]:
-    """Single-flight wrapper for automatic full zip backups."""
+    """Single-flight, Profile-consistent wrapper for automatic full zip backups."""
     try:
-        with _backup_operation_lock(hermes_root):
-            return _write_full_zip_backup_locked(out_path, hermes_root)
+        with profile_mutation_lock(hermes_root):
+            with _backup_operation_lock(hermes_root):
+                return _write_full_zip_backup_locked(out_path, hermes_root)
     except BackupInProgressError as exc:
         logger.warning("Full-zip backup skipped: %s", exc)
         return None

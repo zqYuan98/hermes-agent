@@ -37,10 +37,15 @@ import logging
 import re
 import shutil
 import contextvars as _ctxvars
+from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from hermes_constants import get_hermes_home, display_hermes_home
+from hermes_constants import (
+    display_hermes_home,
+    get_hermes_home,
+    profile_mutation_lock,
+)
 from utils import atomic_write_text, is_truthy_value
 from hermes_cli.config import cfg_get
 from agent.skill_utils import (
@@ -195,6 +200,16 @@ def _containing_skills_root(skill_path: Path) -> Path:
         except (ValueError, OSError):
             continue
     return _skills_dir()
+
+
+def _profile_mutation_entry(func):
+    """Run one low-level Skill mutation under the active Profile lock."""
+    @wraps(func)
+    def _locked(*args, **kwargs):
+        with profile_mutation_lock(_skills_dir().parent):
+            return func(*args, **kwargs)
+
+    return _locked
 
 
 def _is_path_redirect(path: Path) -> bool:
@@ -905,6 +920,7 @@ def _add_description_prompt_preview(result: Dict[str, Any], content: str) -> Non
         )
 
 
+@_profile_mutation_entry
 def _create_skill(name: str, content: str, category: str = None) -> Dict[str, Any]:
     """Create a new user skill with SKILL.md content."""
     # Validate name
@@ -1003,6 +1019,7 @@ def _attach_lint_findings(result: Dict[str, Any], skill_md: Path) -> None:
     )
 
 
+@_profile_mutation_entry
 def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     """Replace the SKILL.md of any existing skill (full rewrite)."""
     err = _validate_frontmatter(content)
@@ -1065,6 +1082,7 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     return result
 
 
+@_profile_mutation_entry
 def _patch_skill(
     name: str,
     old_string: str,
@@ -1185,6 +1203,7 @@ def _patch_skill(
     return result
 
 
+@_profile_mutation_entry
 def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, Any]:
     """Delete a skill.
 
@@ -1293,6 +1312,7 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
     }
 
 
+@_profile_mutation_entry
 def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     """Add or overwrite a supporting file within any skill directory."""
     err = _validate_file_path(file_path)
@@ -1363,6 +1383,7 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     return result
 
 
+@_profile_mutation_entry
 def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     """Remove a supporting file from any skill directory."""
     err = _validate_file_path(file_path)
