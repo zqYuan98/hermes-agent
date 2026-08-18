@@ -41,9 +41,12 @@ with profile_mutation_lock(profile_home, timeout=10):
 _EDIT_WORKER = r"""
 import json
 import sys
+from pathlib import Path
 
 from tools.skill_manager_tool import _edit_skill
 
+if len(sys.argv) > 2:
+    Path(sys.argv[2]).write_text("ready\n", encoding="utf-8")
 result = _edit_skill("demo", sys.argv[1])
 print(json.dumps(result))
 raise SystemExit(0 if result.get("success") else 2)
@@ -173,6 +176,54 @@ def test_agent_private_edit_waits_for_shared_profile_lock(tmp_path: Path) -> Non
             if editor.poll() is not None and editor.returncode != 0:
                 stdout, stderr = editor.communicate()
                 raise AssertionError(f"editor exited early\nstdout={stdout}\nstderr={stderr}")
+
+    _finish(editor)
+    assert skill_md.read_text(encoding="utf-8") == updated
+
+
+def test_external_skill_edit_waits_for_shared_root_lock(tmp_path: Path) -> None:
+    """Profiles sharing one external root must serialize real Skill edits."""
+    root = tmp_path / "hermes"
+    profile_home = root / "profiles" / "demo"
+    profile_home.mkdir(parents=True)
+    external_root = tmp_path / "shared-skills"
+    skill_md = external_root / "demo" / "SKILL.md"
+    skill_md.parent.mkdir(parents=True)
+    original = "---\nname: demo\ndescription: Original.\n---\n\n# Demo\n"
+    updated = "---\nname: demo\ndescription: Updated.\n---\n\n# Demo updated\n"
+    skill_md.write_text(original, encoding="utf-8")
+    (profile_home / "config.yaml").write_text(
+        "skills:\n  external_dirs:\n    - " + str(external_root) + "\n",
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(profile_home)
+    env["PYTHONPATH"] = str(_REPO_ROOT)
+    ready = tmp_path / "external-editor-ready"
+
+    with profile_mutation_lock(external_root, timeout=2):
+        editor = subprocess.Popen(
+            [sys.executable, "-c", _EDIT_WORKER, updated, str(ready)],
+            cwd=str(_REPO_ROOT),
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        _wait_for(ready)
+        try:
+            time.sleep(0.2)
+            assert editor.poll() is None, (
+                "external Skill edit bypassed the shared root lock"
+            )
+            assert skill_md.read_text(encoding="utf-8") == original
+        finally:
+            if editor.poll() is not None and editor.returncode != 0:
+                stdout, stderr = editor.communicate()
+                raise AssertionError(
+                    f"external editor exited early\nstdout={stdout}\nstderr={stderr}"
+                )
 
     _finish(editor)
     assert skill_md.read_text(encoding="utf-8") == updated

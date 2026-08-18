@@ -246,9 +246,7 @@ class TestDispatchersTriggerPluginDiscovery:
 
         return _restore
 
-    def test_web_extract_tool_runs_discovery_before_registry_lookup(
-        self, monkeypatch, stable_public_dns
-    ):
+    def test_web_extract_tool_runs_discovery_before_registry_lookup(self, monkeypatch):
         """``web_extract_tool`` must invoke ``_ensure_web_plugins_loaded()``
         before looking up the configured backend so the registry is
         populated even from cold-start subprocess contexts.
