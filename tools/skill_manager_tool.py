@@ -42,9 +42,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_constants import (
+    canonical_profile_home,
     display_hermes_home,
     get_hermes_home,
-    profile_mutation_lock,
+    profile_mutation_locks,
 )
 from utils import atomic_write_text, is_truthy_value
 from hermes_cli.config import cfg_get
@@ -202,12 +203,40 @@ def _containing_skills_root(skill_path: Path) -> Path:
     return _skills_dir()
 
 
+def _skill_mutation_lock_roots() -> Tuple[Path, ...]:
+    """Return the active Profile plus every configured external Skill root.
+
+    External roots may be shared by multiple Profiles.  Locking only the
+    active Profile would therefore allow two processes to read-modify-write the
+    same external Skill concurrently under different lock identities.
+    """
+    from agent.skill_utils import get_all_skills_dirs
+
+    local_skills = canonical_profile_home(_skills_dir())
+    roots = {canonical_profile_home(_skills_dir().parent)}
+    for root in get_all_skills_dirs():
+        canonical = canonical_profile_home(root)
+        if canonical != local_skills:
+            roots.add(canonical)
+    return tuple(sorted(roots, key=str))
+
+
 def _profile_mutation_entry(func):
-    """Run one low-level Skill mutation under the active Profile lock."""
+    """Run one Skill mutation under its complete, stable root lock set."""
     @wraps(func)
     def _locked(*args, **kwargs):
-        with profile_mutation_lock(_skills_dir().parent):
-            return func(*args, **kwargs)
+        # Configuration may change while this call waits for the locks.  Never
+        # acquire a newly discovered root while retaining an older subset:
+        # release the whole sorted set and retry to avoid ABBA deadlocks.
+        for _attempt in range(4):
+            roots = _skill_mutation_lock_roots()
+            with profile_mutation_locks(roots):
+                if _skill_mutation_lock_roots() != roots:
+                    continue
+                return func(*args, **kwargs)
+        raise RuntimeError(
+            "Skill mutation roots kept changing while acquiring shared locks"
+        )
 
     return _locked
 
@@ -1596,6 +1625,21 @@ def skill_manage(
     if gate_result is not None:
         return gate_result
 
+    # Audit ledger (tracker #79686 P3): capture the pre-mutation state of the
+    # skill directory so every mutation — any actor — lands in the append-only
+    # JSONL ledger with before/after blobs. Telemetry, not a gate: failures
+    # here must NEVER block the mutation (capture_before returns None on
+    # error, and record_mutation below swallows everything).
+    _ledger_before = None
+    _ledger_before_dir = None
+    try:
+        from tools import skill_ledger as _ledger
+        _pre = _find_skill(name)
+        _ledger_before_dir = _pre["path"] if _pre else None
+        _ledger_before = _ledger.capture_before(_ledger_before_dir)
+    except Exception:
+        pass
+
     if action == "create":
         if not content:
             return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
@@ -1632,6 +1676,30 @@ def skill_manage(
         result = {"success": False, "error": f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"}
 
     if result.get("success"):
+        # Audit ledger append (best-effort; never blocks the mutation).
+        try:
+            from tools import skill_ledger as _ledger
+            _post = _find_skill(name)
+            _after_dir = _post["path"] if _post else None
+            _evidence = {}
+            if action == "delete":
+                # Record delete intent: consolidation vs prune, and whether
+                # the recoverable-archive path handled it (curator pass).
+                _evidence["absorbed_into"] = absorbed_into
+                _evidence["archived"] = bool(result.get("_archived"))
+            if session_id:
+                _evidence["session_id"] = session_id
+            if file_path:
+                _evidence["file_path"] = file_path
+            _ledger.record_mutation(
+                action,
+                name,
+                before=_ledger_before if _ledger_before is not None else [],
+                after_root=_after_dir,
+                evidence=_evidence,
+            )
+        except Exception:
+            pass
         try:
             from agent.prompt_builder import clear_skills_system_prompt_cache
             clear_skills_system_prompt_cache(clear_snapshot=True)

@@ -865,14 +865,9 @@ def _ensure_default_soul_md(home: Path) -> None:
 
 
 # Home paths whose directory skeleton has been created this process — see
-# ensure_hermes_home().  Store the joint identity of the home directory and its
-# SOUL.md sentinel, not just the path: taking the Profile mutation lock can
-# recreate ``HERMES_HOME/.locks`` after the whole home was deleted, and filesystems
-# may immediately reuse the deleted directory's inode.  The lock bootstrap does
-# not recreate SOUL.md, so the joint identity reliably distinguishes that empty
-# replacement from the fully initialized tree.  Only successful passes are
-# recorded, so a raised managed-mode/missing-profile error keeps re-checking.
-_HERMES_HOME_ENSURED: Dict[str, Tuple[int, int, int, int]] = {}
+# ensure_hermes_home(). Only successful passes are recorded, so a raised
+# managed-mode/missing-profile error keeps re-checking on later loads.
+_HERMES_HOME_ENSURED: set = set()
 
 
 def ensure_hermes_home():
@@ -893,25 +888,13 @@ def _ensure_hermes_home_unlocked(home: Path) -> None:
     config lock), and the ~14 mkdir/chmod syscalls per call made repeated
     config loads the dominant cost of hot read paths like ``model.options``.
     After the first successful pass for a given ``HERMES_HOME`` we only re-run
-    the full walk if the home skeleton identity is no longer current.  This
-    catches a deleted-and-lock-recreated empty home even when the filesystem
-    immediately reuses its directory inode. Profile switches change
+    the full walk if the home directory itself has vanished (a deleted home is
+    recreated on the next load, as before). Profile switches change
     ``get_hermes_home()`` and therefore re-run for the new path.
     """
     key = str(home)
 
-    try:
-        home_stat = home.stat()
-        soul_stat = (home / "SOUL.md").stat()
-        current_identity = (
-            int(home_stat.st_dev),
-            int(home_stat.st_ino),
-            int(soul_stat.st_dev),
-            int(soul_stat.st_ino),
-        )
-    except OSError:
-        current_identity = None
-    if _HERMES_HOME_ENSURED.get(key) == current_identity and current_identity is not None:
+    if key in _HERMES_HOME_ENSURED and home.is_dir():
         return
     # Named profiles must be created explicitly (e.g. ``hermes profile create``).
     # If a stale process keeps running after the profile was renamed/deleted,
@@ -940,14 +923,7 @@ def _ensure_hermes_home_unlocked(home: Path) -> None:
             _secure_dir(d)
         _ensure_default_soul_md(home)
 
-    ensured_home_stat = home.stat()
-    ensured_soul_stat = (home / "SOUL.md").stat()
-    _HERMES_HOME_ENSURED[key] = (
-        int(ensured_home_stat.st_dev),
-        int(ensured_home_stat.st_ino),
-        int(ensured_soul_stat.st_dev),
-        int(ensured_soul_stat.st_ino),
-    )
+    _HERMES_HOME_ENSURED.add(key)
 
 
 def _ensure_hermes_home_managed(home: Path):
@@ -1317,6 +1293,42 @@ def _warn_once_per_provider(
     logger.warning(msg, *args)
 
 
+_API_MODE_ALIASES = {
+    # Values accepted by earlier releases (and natural spellings) mapped to
+    # the canonical transport names consumed by agent_init. Before this map
+    # existed, an unrecognized api_mode was silently ignored and the
+    # transport fell through to hostname-based guessing, so a config that
+    # said ``api_mode: openai`` (valid on older releases) could flip to
+    # ``codex_responses`` after an update and break the provider (#66543
+    # discussion; observed live against api.actual.inc).
+    "openai": "chat_completions",
+    "openai_chat": "chat_completions",
+    "openai-chat": "chat_completions",
+    "chat-completions": "chat_completions",
+    "chatcompletions": "chat_completions",
+    "responses": "codex_responses",
+    "openai_responses": "codex_responses",
+    "openai-responses": "codex_responses",
+    "anthropic": "anthropic_messages",
+    "anthropic-messages": "anthropic_messages",
+    "messages": "anthropic_messages",
+    "bedrock": "bedrock_converse",
+    "bedrock-converse": "bedrock_converse",
+}
+
+
+def _canonical_api_mode(api_mode: str) -> str:
+    """Map legacy/alias ``api_mode`` spellings to canonical transport names.
+
+    Unknown values pass through unchanged (callers keep their existing
+    fall-through behavior); known aliases are rewritten so downstream
+    consumers (``agent_init``'s accepted-set check, runtime resolution)
+    see a canonical name instead of silently discarding the user's intent.
+    """
+    cleaned = api_mode.strip()
+    return _API_MODE_ALIASES.get(cleaned.lower(), cleaned)
+
+
 def _normalize_custom_provider_entry(
     entry: Any,
     *,
@@ -1358,6 +1370,7 @@ def _normalize_custom_provider_entry(
         # configs don't warn on every load.
         "provider",
         "name", "api", "url", "base_url", "api_key", "key_env", "api_key_env",
+        "key_cmd",
         "api_mode", "transport", "model", "default_model", "models",
         "context_length", "rate_limit_delay",
         "request_timeout_seconds", "stale_timeout_seconds",
@@ -1437,7 +1450,7 @@ def _normalize_custom_provider_entry(
 
     api_mode = entry.get("api_mode") or entry.get("transport")
     if isinstance(api_mode, str) and api_mode.strip():
-        normalized["api_mode"] = api_mode.strip()
+        normalized["api_mode"] = _canonical_api_mode(api_mode)
 
     model_name = entry.get("model") or entry.get("default_model")
     if isinstance(model_name, str) and model_name.strip():
@@ -1964,6 +1977,7 @@ _EXTRA_KNOWN_ROOT_KEYS = {
     "require_mention",       # top-level convenience form honored by the gateway (#3979)
     "unauthorized_dm_behavior",  # top-level form read by gateway/config.py
     "signal",            # Signal settings bridged to env vars by gateway/config.py
+    "timeouts",          # unified timeout resolution section (agent/deadline.py, #85125)
 }
 _KNOWN_ROOT_KEYS = frozenset(DEFAULT_CONFIG.keys()) | _EXTRA_KNOWN_ROOT_KEYS
 
@@ -2844,6 +2858,27 @@ def _strip_default_values(
     return result
 
 
+def split_model_config_default(raw_default: Any) -> tuple[str, str]:
+    """Canonicalize a config ``model.default``/``model.model`` value.
+
+    A dict-valued default (``model.default: {provider: ..., model: ...}``)
+    pairs the model string with the provider it must be routed through. The
+    dict is flattened here at the shared boundary so both halves stay
+    together through ``HermesCLI`` construction: the model becomes a plain
+    string and the provider is returned explicitly instead of being lost to
+    the outer merged ``model.provider`` default (often ``"auto"``, which
+    runtime resolution treats as authoritative and would otherwise route the
+    model through the wrong active provider).
+
+    Returns ``(model, provider)``; both are ``""`` when nothing is usable.
+    """
+    if isinstance(raw_default, dict):
+        provider = str(raw_default.get("provider") or "").strip()
+        model = raw_default.get("model") or raw_default.get("default")
+        return (str(model or "").strip(), provider)
+    return (str(raw_default or "").strip(), "")
+
+
 def _normalize_root_model_keys(config: Dict[str, Any]) -> Dict[str, Any]:
     """Move stale root-level provider/base_url/context_length into model section.
 
@@ -2879,6 +2914,17 @@ def _normalize_root_model_keys(config: Dict[str, Any]) -> Dict[str, Any]:
     # alias, or a model dict whose id lives under a non-canonical key.
     model_in = config.get("model")
     model_has_alias = isinstance(model_in, dict) and model_in.get("api_base")
+    # A dict-valued ``default``/``model`` (``{provider: ..., model: ...}``)
+    # must be flattened into ``default`` (string) + ``provider`` here at the
+    # single load/save chokepoint, so every reader (doctor, status, fallback
+    # picker, prompt-size, context-switch guard, …) sees plain strings instead
+    # of a nested dict that crashes ``.strip()``/``.lower()`` or routes the
+    # model through the wrong provider.
+    _has_nested_default = isinstance(model_in, dict) and (
+        isinstance(model_in.get("default"), dict)
+        or isinstance(model_in.get("model"), dict)
+        or isinstance(model_in.get("name"), dict)
+    )
     # A model dict needs canonicalization if its id lives under a non-canonical
     # key (``model``/``name``) — either because ``default`` is empty (we must
     # promote the alias) or because ``default`` is set but a stale alias still
@@ -2889,7 +2935,7 @@ def _normalize_root_model_keys(config: Dict[str, Any]) -> Dict[str, Any]:
     has_root = any(
         config.get(k) for k in ("provider", "base_url", "context_length", "api_base")
     )
-    if not has_root and not model_has_alias and not model_needs_canon:
+    if not has_root and not model_has_alias and not model_needs_canon and not _has_nested_default:
         return config
 
     config = dict(config)
@@ -2899,6 +2945,24 @@ def _normalize_root_model_keys(config: Dict[str, Any]) -> Dict[str, Any]:
     else:
         model = dict(model)
     config["model"] = model
+
+    # Flatten a dict-valued ``model.default``/``model.model``:
+    # ``{provider: <p>, model: <m>}`` -> ``default: "<m>"`` and, when no
+    # explicit ``model.provider`` is set, ``provider: "<p>"``. The nested
+    # provider must win over the merged default ``"auto"`` (which runtime
+    # resolution treats as authoritative and would otherwise route the model
+    # through the wrong active provider), but never over an explicitly
+    # configured outer provider.
+    for _key in ("default", "model", "name"):
+        _val = model.get(_key)
+        if isinstance(_val, dict):
+            _nested_model = _val.get("model") or _val.get("default")
+            _nested_provider = str(_val.get("provider") or "").strip()
+            model[_key] = str(_nested_model or "").strip()
+            if _nested_provider:
+                _outer_provider = str(model.get("provider") or "").strip()
+                if not _outer_provider or _outer_provider == "auto":
+                    model["provider"] = _nested_provider
 
     for key in ("provider", "base_url", "context_length"):
         root_val = config.get(key)
@@ -3559,7 +3623,18 @@ def _load_config_under_profile_lock(
         # keys the managed layer pins — see docs/design/managed-scope.md §4.1.
         managed_config = managed_scope.load_managed_config()
         if managed_config:
-            managed_expanded = _expand_env_vars(managed_config)
+            # Normalize the managed overlay through the same canonicalization as
+            # the user config BEFORE merging (parity with
+            # managed_scope.apply_managed_overlay): a dict-valued
+            # ``model.default`` (``{provider: ..., model: ...}``) or a bare
+            # ``model: <string>`` must be flattened to a string ``default``
+            # paired with ``provider`` so the merged result never exposes a
+            # nested dict to status/fallback/runtime readers.
+            managed_normalized = _normalize_root_model_keys(managed_config)
+            if isinstance(managed_normalized.get("model"), str):
+                managed_normalized = dict(managed_normalized)
+                managed_normalized["model"] = {"default": managed_normalized["model"]}
+            managed_expanded = _expand_env_vars(managed_normalized)
             expanded = _deep_merge(expanded, managed_expanded)
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         if cache_sig is not None:
@@ -4977,8 +5052,8 @@ def warn_unpinned_cron_jobs_after_model_config_change(
         f"{snapshot_field} values that differ from the new global {axis}. "
         "They will fail closed on their next run instead of silently using the "
         "changed model/provider. Inspect with `hermes cron list`, then pin the "
-        "intended values with `cronjob action=update job_id=<job_id> "
-        "provider=<provider> model=<model>`."
+        "intended values with `hermes cron edit <job_id> --provider <provider> "
+        "--model <model>`."
     )
 
 
@@ -5014,6 +5089,7 @@ _OPEN_DICT_TOP_LEVEL_KEYS = frozenset({
     "server_actions",
     "secrets",
     "goals",
+    "loops",
 })
 
 # Top-level keys whose sub-keys are partially schema-defined (e.g. on a
@@ -5175,6 +5251,41 @@ def _validate_config_key(key: str) -> tuple[bool, Optional[str]]:
     return True, None
 
 
+def _looks_structured_value(value: str) -> bool:
+    """Return True when *value* plausibly encodes a YAML/JSON list or mapping.
+
+    Used by :func:`set_config_value` to decide whether to attempt a
+    ``yaml.safe_load`` structured parse. Deliberately conservative so plain
+    scalars are never mangled:
+
+    - Flow style: the value starts with ``[`` or ``{`` (JSON is a YAML
+      subset, so both ``'["a","b"]'`` and ``'{a: 1}'`` qualify).
+    - Block style: the value spans multiple lines AND at least one line is
+      shaped like a YAML sequence item (``- item``) or mapping entry
+      (``key: value``).
+
+    A bare leading ``-`` is NOT a trigger on its own: ``-5``, ``--flag`` and
+    other dash-prefixed single-line scalars must remain strings.
+    """
+    stripped = value.lstrip()
+    if stripped[:1] in ('[', '{'):
+        return True
+    if '\n' not in value:
+        return False
+    for line in value.splitlines():
+        item = line.strip()
+        if item == '-' or item.startswith('- '):
+            return True
+        # ``key: value`` / ``key:`` mapping-entry shape (no whitespace in the
+        # key, colon followed by a space or end-of-line).
+        head, sep, _rest = item.partition(': ')
+        if sep and head and ' ' not in head and not head.startswith('#'):
+            return True
+        if item.endswith(':') and ' ' not in item[:-1] and item[:-1]:
+            return True
+    return False
+
+
 def set_config_value(key: str, value: str, force: bool = False):
     """Set a configuration value.
 
@@ -5274,6 +5385,38 @@ def _set_config_value_unlocked(
             coerced_value = int(value)
         elif value.replace('.', '', 1).isdigit():
             coerced_value = float(value)
+        elif _looks_structured_value(value):
+            # List/mapping literals -- e.g.
+            #   hermes config set platform_toolsets.line '["file","web"]'
+            # or a multi-line YAML block:
+            #   hermes config set custom_providers '- name: foo
+            #     base_url: https://...'
+            # Without this, such values were stored as a raw STRING, and every
+            # reader that gates on isinstance(..., list) (``_get_platform_tools``,
+            # ``_get_enabled_set``, ...) silently ignored them and fell back to
+            # its default -- the setting looked saved but never took effect.
+            # Folded INSIDE the string-typed guard so a genuinely string-typed
+            # setting whose value merely starts with '[' or '{' is left intact
+            # (preserves the guard added in e4ea0a0ed).  The trigger is
+            # deliberately conservative (see _looks_structured_value): plain
+            # scalars like '-5' or '--flag' never reach the YAML parser.
+            try:
+                parsed = yaml.safe_load(value)
+                if isinstance(parsed, (list, dict)):
+                    coerced_value = parsed
+                else:
+                    print(
+                        f"Warning: value for '{key}' looks like a list/mapping but "
+                        f"parsed as {type(parsed).__name__}; storing as string.",
+                        file=sys.stderr,
+                    )
+            except yaml.YAMLError:
+                print(
+                    f"Warning: value for '{key}' looks like a list/mapping but is "
+                    f"not valid YAML/JSON; storing as string. Most isinstance-gated "
+                    f"readers will ignore a string here.",
+                    file=sys.stderr,
+                )
 
     value = coerced_value
     # Normalize a scalar ``model`` key before writing sub-keys so that

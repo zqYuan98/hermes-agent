@@ -20,7 +20,6 @@ These tests pin the new probe ladder:
 
 from __future__ import annotations
 
-import io
 import subprocess
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -167,17 +166,6 @@ class TestDetectAudioEnvironmentTermuxFallback:
         monkeypatch.delenv("SSH_CLIENT", raising=False)
         monkeypatch.delenv("SSH_TTY", raising=False)
         monkeypatch.delenv("SSH_CONNECTION", raising=False)
-
-        # Model Android/Termux even when pytest itself runs under WSL. The
-        # unrelated host audio gate must not affect this Termux probe test.
-        real_open = open
-
-        def fake_open(path, *args, **kwargs):
-            if str(path) == "/proc/version":
-                return io.StringIO("Linux version 6.8.0-generic")
-            return real_open(path, *args, **kwargs)
-
-        monkeypatch.setattr("builtins.open", fake_open)
 
         # No sounddevice — we go down the Termux:API branch.
         monkeypatch.setattr(
