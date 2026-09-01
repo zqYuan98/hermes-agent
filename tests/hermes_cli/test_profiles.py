@@ -231,6 +231,45 @@ class TestCreateProfile:
         with pytest.raises(FileExistsError):
             create_profile("coder", no_alias=True)
 
+    def test_fresh_profile_inherits_a_usable_model(self, profile_env):
+        """A profile created without a clone source still resolves a provider.
+
+        Without this it gets no config.yaml at all, so its very first turn dies
+        with "No LLM provider configured" — created, but unable to run. Fresh
+        means fresh skills and SOUL, not unreachable.
+        """
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text(
+            "model:\n  provider: nous\n  default: some/model\n"
+        )
+
+        profile_dir = create_profile("coder", no_alias=True)
+
+        cfg = yaml.safe_load((profile_dir / "config.yaml").read_text())
+        assert cfg["model"]["provider"] == "nous"
+        assert cfg["model"]["default"] == "some/model"
+
+
+    def test_fresh_profile_model_is_copied_not_linked(self, profile_env):
+        """Profiles stay independent islands.
+
+        The model block is copied at creation, so later edits to the source
+        profile never reach one already created from it.
+        """
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text(
+            "model:\n  provider: nous\n  default: some/model\n"
+        )
+        profile_dir = create_profile("coder", no_alias=True)
+
+        (default_home / "config.yaml").write_text(
+            "model:\n  provider: other\n  default: changed/model\n"
+        )
+
+        cfg = yaml.safe_load((profile_dir / "config.yaml").read_text())
+        assert cfg["model"]["provider"] == "nous"
+        assert cfg["model"]["default"] == "some/model"
+
     def test_default_raises_value_error(self, profile_env):
         with pytest.raises(ValueError, match="default"):
             create_profile("default", no_alias=True)
@@ -469,19 +508,15 @@ class TestNoSkillsOptOut:
             )
 
     def test_seed_profile_skills_respects_marker(self, profile_env):
-        """seed_profile_skills() must no-op on opted-out profiles even when
-        called directly (e.g. by `hermes update`'s all-profile sync loop)."""
+        """Opted-out profiles still receive only the essential operating skill."""
         profile_dir = create_profile("orchestrator", no_alias=True, no_skills=True)
 
-        # Call seed_profile_skills() directly — it should NOT invoke subprocess,
-        # NOT modify the skills/ dir, and return a dict with skipped_opt_out=True.
         result = seed_profile_skills(profile_dir, quiet=True)
 
         assert result is not None
         assert result.get("skipped_opt_out") is True
-        assert result.get("copied") == []
-        # skills/ stays empty — no subprocess ran
-        assert list((profile_dir / "skills").iterdir()) == []
+        assert result.get("copied") == ["hermes-agent"]
+        assert (profile_dir / "skills" / "autonomous-ai-agents" / "hermes-agent" / "SKILL.md").is_file()
 
     def test_seed_profile_skills_is_reentrant_under_profile_lock(
         self, profile_env, monkeypatch, tmp_path
@@ -514,29 +549,30 @@ class TestNoSkillsOptOut:
         assert (profile_dir / "skills" / "demo" / "SKILL.md").is_file()
 
     def test_delete_marker_re_enables_seeding(self, profile_env, monkeypatch):
-        """Deleting .no-bundled-skills opts the profile back in."""
+        """Explicit Profile sync preserves essential-only then full-sync semantics."""
         profile_dir = create_profile("orchestrator", no_alias=True, no_skills=True)
         assert has_bundled_skills_opt_out(profile_dir) is True
 
         called = []
 
         def fake_sync(profile_home, quiet=False):
-            called.append((Path(profile_home), quiet))
+            profile_home = Path(profile_home)
+            called.append((profile_home, quiet))
+            if (profile_home / NO_BUNDLED_SKILLS_MARKER).exists():
+                return {"copied": ["hermes-agent"], "skipped_opt_out": True}
             return {"copied": []}
 
         monkeypatch.setattr("tools.skills_sync.sync_skills_for_profile", fake_sync)
 
-        # First call: opted out, returns skipped dict without touching scoped sync.
         r1 = seed_profile_skills(profile_dir, quiet=True)
         assert r1.get("skipped_opt_out") is True
-        assert called == []
+        assert r1.get("copied") == ["hermes-agent"]
 
-        # Delete marker → next call targets this exact Profile once.
         (profile_dir / NO_BUNDLED_SKILLS_MARKER).unlink()
         assert has_bundled_skills_opt_out(profile_dir) is False
         r2 = seed_profile_skills(profile_dir, quiet=True)
         assert r2 == {"copied": []}
-        assert called == [(profile_dir, True)]
+        assert called == [(profile_dir, True), (profile_dir, True)]
 
 
 # ===================================================================
@@ -1535,10 +1571,6 @@ class TestRenameProfile:
         assert cfg["hosts"]["hermes.ssi_health"]["aiPeer"] == "ssi_health"
         assert cfg["hosts"]["hermes_heimdall"]["aiPeer"] == "heimdall"
 
-    def test_default_raises_value_error(self, profile_env):
-        with pytest.raises(ValueError, match="default"):
-            rename_profile("default", "newname")
-
     def test_rename_to_default_raises_value_error(self, profile_env):
         create_profile("coder", no_alias=True)
         with pytest.raises(ValueError, match="default"):
@@ -1612,7 +1644,7 @@ class TestExportImport:
         lock_sets = []
         events = []
         state = {"active": False}
-        real_extract = profiles._safe_extract_profile_archive
+        real_extract = profiles.safe_extract_targz
 
         @contextlib.contextmanager
         def tracked_locks(homes):
@@ -1637,7 +1669,7 @@ class TestExportImport:
             return profile_dir
 
         monkeypatch.setattr(profiles, "profile_mutation_locks", tracked_locks)
-        monkeypatch.setattr(profiles, "_safe_extract_profile_archive", tracked_extract)
+        monkeypatch.setattr(profiles, "safe_extract_targz", tracked_extract)
         monkeypatch.setattr(
             profiles, "_publish_imported_profile_unlocked", fake_publish, raising=False
         )

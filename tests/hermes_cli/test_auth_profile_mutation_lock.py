@@ -105,6 +105,26 @@ def test_auth_store_lock_rejects_dynamic_global_expansion(tmp_path, monkeypatch)
                 pass
 
 
+def test_auth_store_lock_predeclares_and_reuses_shared_credential_path(
+    tmp_path, monkeypatch
+):
+    import pytest
+    from hermes_cli import auth
+
+    active_path = tmp_path / "profiles" / "work" / "auth.json"
+    shared_path = tmp_path / "shared" / "credentials.json"
+    other_path = tmp_path / "shared" / "other.json"
+    monkeypatch.setattr(auth, "_auth_file_path", lambda: active_path)
+
+    with auth._auth_store_lock(extra_paths=(shared_path,)) as outer:
+        assert outer.extra_paths == (shared_path.resolve(),)
+        with auth._auth_store_lock(extra_paths=(shared_path,)) as inner:
+            assert inner is outer
+        with pytest.raises(RuntimeError, match="expand.*shared credential paths"):
+            with auth._auth_store_lock(extra_paths=(other_path,)):
+                pass
+
+
 def test_default_auth_io_and_fallback_reuse_outer_frozen_paths(tmp_path, monkeypatch):
     import json
     from hermes_cli import auth
