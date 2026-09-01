@@ -52,6 +52,7 @@ from hermes_cli.config import (
     is_managed,
     managed_error,
     read_raw_config,
+    read_user_config_raw,
     save_env_value,
     write_platform_config_field,
 )
@@ -3894,18 +3895,57 @@ def _stable_service_working_dir() -> str:
     return str(PROJECT_ROOT)
 
 
-def _systemd_watchdog_seconds(hermes_home: str | Path | None = None) -> int:
-    """Resolve the managed-overlay-aware watchdog setting for a service home."""
-    override_token = None
-    reset_home_override = None
-    if hermes_home is not None:
-        from hermes_constants import (
-            reset_hermes_home_override,
-            set_hermes_home_override,
+def _watchdog_value_from_mapping(data: object) -> object:
+    """Return a watchdog value from the loader's supported mapping shapes."""
+    if not isinstance(data, dict):
+        return None
+    if "systemd_watchdog_seconds" in data:
+        return data.get("systemd_watchdog_seconds")
+    nested = data.get("gateway")
+    if isinstance(nested, dict) and "systemd_watchdog_seconds" in nested:
+        return nested.get("systemd_watchdog_seconds")
+    return None
+
+
+def _systemd_watchdog_seconds_for_home(hermes_home: str | Path) -> int:
+    """Project the target service watchdog without plugins or Profile writes."""
+    home = Path(hermes_home)
+    raw = None
+
+    legacy_path = home / "gateway.json"
+    try:
+        if legacy_path.exists():
+            with legacy_path.open("r", encoding="utf-8") as handle:
+                raw = _watchdog_value_from_mapping(json.load(handle) or {})
+    except Exception as exc:
+        logger.warning("Failed to read target %s: %s", legacy_path, exc)
+
+    try:
+        yaml_cfg = read_user_config_raw(home / "config.yaml")
+        from hermes_cli import managed_scope
+
+        yaml_cfg = managed_scope.apply_managed_overlay(dict(yaml_cfg))
+        # Match load_gateway_config(): config.yaml overrides gateway.json only
+        # through the documented nested gateway.* form.
+        gateway_section = yaml_cfg.get("gateway")
+        if (
+            isinstance(gateway_section, dict)
+            and "systemd_watchdog_seconds" in gateway_section
+        ):
+            raw = gateway_section.get("systemd_watchdog_seconds")
+    except Exception as exc:
+        logger.warning(
+            "Could not read target systemd watchdog config; using fallback: %s",
+            exc,
         )
 
-        override_token = set_hermes_home_override(hermes_home)
-        reset_home_override = reset_hermes_home_override
+    return coerce_systemd_watchdog_seconds(raw)
+
+
+def _systemd_watchdog_seconds(hermes_home: str | Path | None = None) -> int:
+    """Resolve the watchdog setting for an explicit or active service home."""
+    if hermes_home is not None:
+        return _systemd_watchdog_seconds_for_home(hermes_home)
     try:
         config = load_gateway_config()
         return coerce_systemd_watchdog_seconds(
@@ -3917,9 +3957,6 @@ def _systemd_watchdog_seconds(hermes_home: str | Path | None = None) -> int:
             exc_info=True,
         )
         return 0
-    finally:
-        if override_token is not None and reset_home_override is not None:
-            reset_home_override(override_token)
 
 
 def _systemd_watchdog_service_fields(
@@ -4013,19 +4050,16 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         "/sbin",
         "/bin",
     ]
-    # TimeoutStopSec must cover the full stop budget, not just
-    # restart_drain_timeout. Cron work can legally wait cron_drain_timeout
-    # plus cleanup reserve before interrupt/teardown, and systemd SIGKILLs
-    # if the unit's deadline is shorter (#94759). 30s of post-drain headroom
-    # is preserved on top, with a 60s floor.
-    restart_timeout = resolve_systemd_timeout_stop_sec(
-        _get_restart_drain_timeout(),
-        _get_cron_drain_timeout(),
-    )
-
     if system:
         username, group_name, home_dir = _system_service_identity(run_as_user)
         hermes_home = _hermes_home_for_target_user(home_dir)
+        # Resolve Profile-derived stop budgets from the target service Profile.
+        # A sudo/root caller must not read or lock /root/.hermes while rendering
+        # a unit for another user.
+        restart_timeout = resolve_systemd_timeout_stop_sec(
+            _get_restart_drain_timeout_for_home(hermes_home),
+            _get_cron_drain_timeout_for_home(hermes_home),
+        )
         systemd_type, systemd_watchdog_directives = _systemd_watchdog_service_fields(
             hermes_home
         )
@@ -4090,10 +4124,14 @@ StandardError=journal
 WantedBy=multi-user.target
 """
 
-    hermes_home = str(get_hermes_home().resolve())
-    systemd_type, systemd_watchdog_directives = _systemd_watchdog_service_fields(
-        hermes_home
+    # User units retain the ordinary active-Profile readers and their canonical
+    # Profile-lock semantics. TimeoutStopSec covers both restart and cron drain.
+    restart_timeout = resolve_systemd_timeout_stop_sec(
+        _get_restart_drain_timeout(),
+        _get_cron_drain_timeout(),
     )
+    hermes_home = str(get_hermes_home().resolve())
+    systemd_type, systemd_watchdog_directives = _systemd_watchdog_service_fields()
     profile_arg = _profile_arg(hermes_home)
     path_entries.extend(_build_user_local_paths(Path.home(), path_entries))
     path_entries.extend(_build_wsl_interop_paths(path_entries))
@@ -4444,12 +4482,51 @@ def _get_restart_drain_timeout() -> float:
     return parse_restart_drain_timeout(raw)
 
 
+def _read_gateway_timeout_projection(hermes_home: str | Path) -> dict:
+    """Read a foreign target Profile without ambient locks or recovery writes."""
+    try:
+        cfg = read_user_config_raw(Path(hermes_home) / "config.yaml")
+    except Exception as exc:
+        logger.warning(
+            "Could not read target gateway timeout config; using defaults: %s",
+            exc,
+        )
+        return {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _get_restart_drain_timeout_for_home(hermes_home: str | Path) -> float:
+    """Project restart timeout from one explicit target Profile."""
+    raw = os.getenv("HERMES_RESTART_DRAIN_TIMEOUT", "").strip()
+    if not raw:
+        cfg = _read_gateway_timeout_projection(hermes_home)
+        agent_cfg = cfg.get("agent", {}) if isinstance(cfg, dict) else {}
+        raw = str(
+            agent_cfg.get(
+                "restart_drain_timeout", DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
+            )
+        )
+    return parse_restart_drain_timeout(raw)
+
+
 def _get_cron_drain_timeout() -> float:
     """Return the configured cron-only drain floor in seconds (#82161)."""
     env_raw = os.getenv("HERMES_CRON_DRAIN_TIMEOUT")
     if env_raw is not None and str(env_raw).strip() != "":
         return parse_cron_drain_timeout(env_raw)
     cfg = read_raw_config()
+    agent_cfg = cfg.get("agent", {}) if isinstance(cfg, dict) else {}
+    if isinstance(agent_cfg, dict) and "cron_drain_timeout" in agent_cfg:
+        return parse_cron_drain_timeout(agent_cfg.get("cron_drain_timeout"))
+    return parse_cron_drain_timeout(None)
+
+
+def _get_cron_drain_timeout_for_home(hermes_home: str | Path) -> float:
+    """Project cron drain floor from one explicit target Profile."""
+    env_raw = os.getenv("HERMES_CRON_DRAIN_TIMEOUT")
+    if env_raw is not None and str(env_raw).strip() != "":
+        return parse_cron_drain_timeout(env_raw)
+    cfg = _read_gateway_timeout_projection(hermes_home)
     agent_cfg = cfg.get("agent", {}) if isinstance(cfg, dict) else {}
     if isinstance(agent_cfg, dict) and "cron_drain_timeout" in agent_cfg:
         return parse_cron_drain_timeout(agent_cfg.get("cron_drain_timeout"))

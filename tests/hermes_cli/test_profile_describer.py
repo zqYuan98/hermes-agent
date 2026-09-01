@@ -26,7 +26,11 @@ def profile_env(tmp_path, monkeypatch):
 
 def test_read_profile_meta_empty_when_missing(profile_env):
     meta = profiles_mod.read_profile_meta(profile_env)
-    assert meta == {"description": "", "description_auto": False}
+    assert meta == {
+        "description": "",
+        "description_auto": False,
+        "display_name": "",
+    }
 
 
 def test_write_profile_meta_holds_target_profile_lock(profile_env, monkeypatch):
@@ -47,7 +51,11 @@ def test_write_profile_meta_holds_target_profile_lock(profile_env, monkeypatch):
     def fake_write_unlocked(profile_dir, **kwargs):
         assert state["active"], "profile metadata RMW ran outside Profile lock"
         assert Path(profile_dir).resolve() == profile_env.resolve()
-        assert kwargs == {"description": "locked", "description_auto": False}
+        assert kwargs == {
+            "description": "locked",
+            "description_auto": False,
+            "display_name": None,
+        }
 
     monkeypatch.setattr(profiles_mod, "profile_mutation_lock", tracked_lock)
     monkeypatch.setattr(
@@ -95,7 +103,11 @@ def test_write_profile_meta_rejects_missing_dir(tmp_path):
 def test_read_profile_meta_tolerates_corrupt_yaml(profile_env):
     (profile_env / "profile.yaml").write_text("not: valid: yaml: [unclosed")
     meta = profiles_mod.read_profile_meta(profile_env)
-    assert meta == {"description": "", "description_auto": False}
+    assert meta == {
+        "description": "",
+        "description_auto": False,
+        "display_name": "",
+    }
 
 
 # ---------------------------------------------------------------------------

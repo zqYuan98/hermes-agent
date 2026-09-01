@@ -1249,10 +1249,18 @@ class TestSystemUnitHermesHome:
         monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: root_hermes)
         monkeypatch.setattr(gateway_cli, "_build_service_path_dirs", lambda: [])
 
-        monkeypatch.setattr(gateway_cli.shutil, "which", lambda name: "/root/bin/node")
+        monkeypatch.setattr(
+            gateway_cli.shutil,
+            "which",
+            lambda name: "/root/bin/node" if name == "node" else None,
+        )
         root_unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
 
-        monkeypatch.setattr(gateway_cli.shutil, "which", lambda name: "/home/alice/.local/bin/node")
+        monkeypatch.setattr(
+            gateway_cli.shutil,
+            "which",
+            lambda name: "/home/alice/.local/bin/node" if name == "node" else None,
+        )
         user_unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
 
         assert root_unit == user_unit
@@ -1296,6 +1304,50 @@ class TestSystemUnitHermesHome:
 
         assert 'HERMES_HOME=/home/alice/.hermes' in unit
         assert '/root/.hermes' not in unit
+
+    def test_system_unit_projects_timeout_from_target_without_caller_lock(
+        self, monkeypatch, tmp_path
+    ):
+        root_home = tmp_path / "root"
+        alice_home = tmp_path / "alice"
+        root_hermes = root_home / ".hermes"
+        alice_hermes = alice_home / ".hermes"
+        root_hermes.mkdir(parents=True)
+        alice_hermes.mkdir(parents=True)
+        root_config = root_hermes / "config.yaml"
+        alice_config = alice_hermes / "config.yaml"
+        root_config.write_text(
+            "agent:\n  restart_drain_timeout: 15\n", encoding="utf-8"
+        )
+        alice_config.write_text(
+            "agent:\n  restart_drain_timeout: 180\n", encoding="utf-8"
+        )
+        root_before = (root_config.read_bytes(), root_config.stat().st_mtime_ns)
+        alice_before = (alice_config.read_bytes(), alice_config.stat().st_mtime_ns)
+
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: root_home))
+        monkeypatch.setenv("HERMES_HOME", str(root_hermes))
+        monkeypatch.delenv("HERMES_RESTART_DRAIN_TIMEOUT", raising=False)
+        monkeypatch.delenv("HERMES_CRON_DRAIN_TIMEOUT", raising=False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_system_service_identity",
+            lambda run_as_user=None: ("alice", "alice", str(alice_home)),
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_build_user_local_paths", lambda home, existing: []
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_build_wsl_interop_paths", lambda existing: []
+        )
+        monkeypatch.setattr(gateway_cli.shutil, "which", lambda cmd: None)
+
+        unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
+
+        assert "TimeoutStopSec=210" in unit
+        assert not (root_hermes / ".locks").exists()
+        assert (root_config.read_bytes(), root_config.stat().st_mtime_ns) == root_before
+        assert (alice_config.read_bytes(), alice_config.stat().st_mtime_ns) == alice_before
 
 
     def test_user_unit_unaffected_by_change(self):

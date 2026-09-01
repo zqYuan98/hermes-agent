@@ -56,5 +56,6 @@ def test_system_unit_reads_watchdog_from_target_home(tmp_path, monkeypatch):
 
     assert "Type=notify" in unit
     assert "WatchdogSec=75s" in unit
+    assert not (caller_home / ".locks").exists()
 
 

@@ -939,9 +939,30 @@ def _ensure_default_soul_md(home: Path) -> None:
 
 
 # Home paths whose directory skeleton has been created this process — see
-# ensure_hermes_home(). Only successful passes are recorded, so a raised
-# managed-mode/missing-profile error keeps re-checking on later loads.
-_HERMES_HOME_ENSURED: set = set()
+# ensure_hermes_home(). Bind the memo to the home and SOUL.md object identities:
+# acquiring the Profile lock for a deleted home recreates ``.locks/`` first, so
+# checking only ``home.is_dir()`` would mistake that lock shell for a complete
+# Hermes tree and skip restoring sessions/logs/etc.
+_HERMES_HOME_ENSURED: Dict[str, Tuple[int, int, int, int]] = {}
+
+
+def _hermes_home_skeleton_identity(
+    home: Path,
+) -> Optional[Tuple[int, int, int, int]]:
+    """Return a cheap completeness sentinel without re-walking every subdir."""
+    try:
+        home_stat = os.stat(home, follow_symlinks=False)
+        soul_stat = os.stat(home / "SOUL.md", follow_symlinks=False)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(home_stat.st_mode) or not stat.S_ISREG(soul_stat.st_mode):
+        return None
+    return (
+        int(home_stat.st_dev),
+        int(home_stat.st_ino),
+        int(soul_stat.st_dev),
+        int(soul_stat.st_ino),
+    )
 
 
 def ensure_hermes_home():
@@ -973,7 +994,11 @@ def _ensure_hermes_home_unlocked(home: Path) -> None:
     # the deleted-profile guard.
     from hermes_constants import assert_named_profile_home_live
     assert_named_profile_home_live(home)
-    if key in _HERMES_HOME_ENSURED and home.is_dir():
+    memo_identity = _HERMES_HOME_ENSURED.get(key)
+    if (
+        memo_identity is not None
+        and _hermes_home_skeleton_identity(home) == memo_identity
+    ):
         return
     if is_managed():
         old_umask = os.umask(0o007)
@@ -993,7 +1018,11 @@ def _ensure_hermes_home_unlocked(home: Path) -> None:
             _secure_dir(d)
         _ensure_default_soul_md(home)
 
-    _HERMES_HOME_ENSURED.add(key)
+    identity = _hermes_home_skeleton_identity(home)
+    if identity is not None:
+        _HERMES_HOME_ENSURED[key] = identity
+    else:
+        _HERMES_HOME_ENSURED.pop(key, None)
 
 
 def _ensure_hermes_home_managed(home: Path):

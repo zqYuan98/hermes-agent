@@ -1714,9 +1714,15 @@ class TestExecuteToolCalls:
         tc2 = _mock_tool_call(name="web_search", arguments="{}", call_id="c2")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
         messages = []
+        mock_sleep = MagicMock()
+        local_time = SimpleNamespace(
+            time=time.time,
+            monotonic=time.monotonic,
+            sleep=mock_sleep,
+        )
         with (
             patch("run_agent.handle_function_call", return_value="ok") as mock_hfc,
-            patch("agent.tool_executor.time.sleep") as mock_sleep,
+            patch("agent.tool_executor.time", local_time),
         ):
             agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
         assert mock_hfc.call_count == 2

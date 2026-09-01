@@ -4,6 +4,13 @@ import pytest
 from hermes_cli.config import _expand_env_vars, load_config
 
 
+def _bind_config_home(monkeypatch, config_file):
+    """Bind the transaction owner, not the obsolete downstream path helper."""
+    monkeypatch.setitem(
+        load_config.__globals__, "get_hermes_home", lambda: config_file.parent
+    )
+
+
 class TestExpandEnvVars:
     def test_simple_substitution(self):
         with pytest.MonkeyPatch().context() as mp:
@@ -40,7 +47,7 @@ class TestLoadConfigExpansion:
         # Patch the imported function's own globals. Other tests may reload
         # hermes_cli.config, making string-target monkeypatches hit a different
         # module object than this collection-time imported load_config().
-        monkeypatch.setitem(load_config.__globals__, "get_config_path", lambda: config_file)
+        _bind_config_home(monkeypatch, config_file)
 
         config = load_config()
 
@@ -60,7 +67,7 @@ class TestLoadConfigCacheEnvStaleness:
         config_file.write_text(config_yaml)
 
         monkeypatch.delenv("LATE_DOTENV_KEY_58514", raising=False)
-        monkeypatch.setitem(load_config.__globals__, "get_config_path", lambda: config_file)
+        _bind_config_home(monkeypatch, config_file)
 
         # First load happens before the var exists (pre-dotenv): literal kept.
         assert load_config()["auxiliary"]["vision"]["api_key"] == "${LATE_DOTENV_KEY_58514}"
@@ -76,7 +83,7 @@ class TestLoadConfigCacheEnvStaleness:
         config_file.write_text(config_yaml)
 
         monkeypatch.setenv("STABLE_KEY_58514", "key-stable")
-        monkeypatch.setitem(load_config.__globals__, "get_config_path", lambda: config_file)
+        _bind_config_home(monkeypatch, config_file)
 
         load_config()
         # load_config_readonly() returns the cached object itself, so object
