@@ -58,6 +58,11 @@ jobs:
   # by both route matrices, so the two routes cover the same set.
   pick-releases:
     name: Pick release tags
+    # Scheduled install matrices are an upstream maintenance signal. Running
+    # the same expensive, currently flaky matrix in every personal fork only
+    # duplicates failures and notification email. Forks keep manual and release-
+    # tag execution, while scheduled runs become an intentional no-op.
+    if: github.event_name != 'schedule' || github.repository == 'NousResearch/hermes-agent'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
