@@ -597,6 +597,28 @@ def _cmd_ledger(args) -> int:
     return 0
 
 
+def _archive_retention_timestamp(path: Path, usage: dict) -> float:
+    """Return the real archive time, falling back for legacy records only.
+
+    ``Path.rename`` preserves a skill directory's old mtime. Using that mtime
+    for retention therefore purges a 90-day-idle skill immediately after it is
+    archived instead of granting the configured rollback window.
+    """
+    from tools.skill_usage import _read_skill_name
+
+    name = _read_skill_name(path / "SKILL.md", fallback=path.name)
+    archived_at = (usage.get(name) or {}).get("archived_at")
+    if archived_at:
+        try:
+            value = datetime.fromisoformat(str(archived_at))
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            return value.timestamp()
+        except (TypeError, ValueError):
+            pass
+    return path.stat().st_mtime
+
+
 def _cmd_purge(args) -> int:
     """Delete archived skills older than curator.archive_ttl_days.
 
@@ -606,7 +628,8 @@ def _cmd_purge(args) -> int:
     """
     from hermes_cli.config import cfg_get, load_config
     from tools import skill_ledger
-    from tools.skill_usage import _archive_dir
+    from tools.skill_usage import _archive_dir, load_usage
+    from tools.skills_sync import _rmtree_writable
 
     ttl_days = getattr(args, "days", None)
     if ttl_days is None:
@@ -623,13 +646,13 @@ def _cmd_purge(args) -> int:
         print("curator: no archive directory — nothing to purge.")
         return 0
 
-    import shutil
     import time
 
     cutoff = time.time() - ttl_days * 86400
+    usage = load_usage()
     candidates = [
         p for p in archive_root.iterdir()
-        if p.is_dir() and p.stat().st_mtime < cutoff
+        if p.is_dir() and _archive_retention_timestamp(p, usage) < cutoff
     ]
     if not candidates:
         print(f"curator: no archived skills older than {ttl_days}d.")
@@ -657,7 +680,7 @@ def _cmd_purge(args) -> int:
             p, complete_package=True, skill=p.name
         )
         try:
-            shutil.rmtree(p)
+            _rmtree_writable(p)
         except OSError as e:
             print(f"curator: failed to purge {p.name}: {e}")
             continue

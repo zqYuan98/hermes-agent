@@ -12,6 +12,8 @@ Covers:
 
 from __future__ import annotations
 
+import os
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 
@@ -66,6 +68,31 @@ def _mk_record(name, *, idle_days=0, pinned=False, state="active", created_idle_
 
 
 
+
+
+# ─── purge retention ───────────────────────────────────────────────────────
+
+
+def test_archive_retention_uses_archived_at_not_preserved_directory_mtime(tmp_path):
+    import hermes_cli.curator as curator_cli
+
+    archive = tmp_path / "old-folder-name"
+    archive.mkdir()
+    (archive / "SKILL.md").write_text(
+        "---\nname: canonical-name\ndescription: test\n---\n",
+        encoding="utf-8",
+    )
+    old = (datetime.now(timezone.utc) - timedelta(days=120)).timestamp()
+    os.utime(archive, (old, old))
+    archived_at = datetime.now(timezone.utc) - timedelta(hours=1)
+
+    actual = curator_cli._archive_retention_timestamp(
+        archive,
+        {"canonical-name": {"archived_at": archived_at.isoformat()}},
+    )
+
+    assert abs(actual - archived_at.timestamp()) < 1
+    assert actual != archive.stat().st_mtime
 
 
 # ─── argparse wiring ────────────────────────────────────────────────────────

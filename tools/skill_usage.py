@@ -1089,6 +1089,29 @@ def forget(skill_name: str) -> None:
 # Archive / restore
 # ---------------------------------------------------------------------------
 
+
+def _make_tree_owner_writable(root: Path) -> None:
+    """Make a user-owned skill tree movable/removable without following links.
+
+    Bundled skills copied from immutable package sources intentionally retain
+    read-only directory modes. On WSL/Linux, moving a directory across parents
+    updates its ``..`` entry and therefore requires owner-write permission on
+    the directory itself; ``shutil.move`` also needs writable descendants to
+    remove the source after a cross-device copy.
+    """
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        current = Path(dirpath)
+        paths = [(current, 0o700)]
+        paths.extend((current / name, 0o700) for name in dirnames)
+        paths.extend((current / name, 0o600) for name in filenames)
+        for path, bits in paths:
+            if path.is_symlink():
+                continue
+            mode = path.stat().st_mode
+            if mode & bits != bits:
+                path.chmod(mode | bits)
+
+
 @_profile_mutation_entry
 def archive_skill(skill_name: str) -> Tuple[bool, str]:
     """Move a curator-eligible skill directory to ~/.hermes/skills/.archive/.
@@ -1147,11 +1170,17 @@ def archive_skill(skill_name: str) -> Tuple[bool, str]:
         _ledger = None  # type: ignore[assignment]
 
     try:
+        # Read-only bundled directories cannot be re-parented on WSL/Linux
+        # until their own directory entry is owner-writable.
+        mode = skill_dir.stat().st_mode
+        if mode & 0o700 != 0o700:
+            skill_dir.chmod(mode | 0o700)
         skill_dir.rename(dest)
     except OSError:
-        # Cross-device — fall back to shutil.move
+        # Cross-device — make the whole source removable, then copy+delete.
         import shutil
         try:
+            _make_tree_owner_writable(skill_dir)
             shutil.move(str(skill_dir), str(dest))
         except Exception as e2:
             return False, f"failed to archive: {e2}"
@@ -1243,10 +1272,14 @@ def restore_skill(skill_name: str) -> Tuple[bool, str]:
         _ledger = None  # type: ignore[assignment]
 
     try:
+        mode = src.stat().st_mode
+        if mode & 0o700 != 0o700:
+            src.chmod(mode | 0o700)
         src.rename(dest)
     except OSError:
         import shutil
         try:
+            _make_tree_owner_writable(src)
             shutil.move(str(src), str(dest))
         except Exception as e:
             return False, f"failed to restore: {e}"

@@ -393,6 +393,39 @@ def test_is_agent_created(skills_home):
 # ---------------------------------------------------------------------------
 
 
+def test_archive_and_restore_read_only_bundled_tree(skills_home, monkeypatch):
+    """Immutable-package modes must not break curator pruning on WSL/Linux."""
+    from tools import skill_usage
+
+    skills_dir = skills_home / "skills"
+    skill_dir = _write_skill(skills_dir, "read-only", category="research")
+    scripts = skill_dir / "scripts"
+    scripts.mkdir()
+    helper = scripts / "helper.py"
+    helper.write_text("print('ok')\n", encoding="utf-8")
+    (skills_dir / ".bundled_manifest").write_text(
+        "read-only:abc123\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(skill_usage, "_prune_builtins_enabled", lambda: True)
+
+    helper.chmod(0o444)
+    scripts.chmod(0o555)
+    (skill_dir / "SKILL.md").chmod(0o444)
+    skill_dir.chmod(0o555)
+
+    ok, message = skill_usage.archive_skill("read-only")
+    assert ok, message
+    archived = skills_dir / ".archive" / "read-only"
+    assert archived.is_dir()
+    assert not skill_dir.exists()
+    assert (archived / "scripts" / "helper.py").read_text() == "print('ok')\n"
+
+    ok, message = skill_usage.restore_skill("read-only")
+    assert ok, message
+    assert (skills_dir / "read-only" / "scripts" / "helper.py").is_file()
+    assert not archived.exists()
+
+
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
